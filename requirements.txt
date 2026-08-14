@@ -1,0 +1,42 @@
+# ============================================================================
+#  UR GUI Simulator — Python dependencies
+#  Python 3.10 - 3.13.  Install:  pip install -r requirements.txt
+#
+#  The application degrades gracefully: only PySide6 + numpy are strictly
+#  required to launch (offline simulation / digital twin still work).
+#  Everything else unlocks a feature and is imported lazily.
+# ============================================================================
+
+# ----- Core GUI (REQUIRED) --------------------------------------------------
+PySide6>=6.6,<6.9          # Qt 6 bindings — main window, docks, widgets
+numpy>=1.24                # linear algebra everywhere (poses, DH, transforms)
+
+# ----- Robot communication (recommended) ------------------------------------
+ur_rtde>=1.5.6             # RTDE control/receive + dashboard client.
+                           #   Falls back to raw sockets (30002/30003/29999)
+                           #   when unavailable. Prebuilt wheels: win/linux.
+
+# ----- Kinematics (recommended) ---------------------------------------------
+ikpy>=3.3.3                # URDF-based FK/IK. Optional — a built-in DH
+                           #   solver in robot/kinematics.py is the fallback.
+# roboticstoolbox-python>=1.1   # heavier alt IK/traj; enable if you prefer it
+# spatialmath-python>=1.1       # (pulled in by roboticstoolbox)
+
+# ----- 3D visualization (recommended) ---------------------------------------
+pyvista>=0.43              # high-level VTK wrapper for the viewport
+pyvistaqt>=0.11            # QtInteractor — embeds the render window in Qt
+vtk>=9.2                   # rendering backend (pulled by pyvista)
+# open3d>=0.18             # alternative viewport / point-cloud path
+
+# ----- CAD import & mesh processing (recommended) ---------------------------
+trimesh>=4.0               # STL/OBJ/PLY + scene graph; edge/curve extraction
+# pythonocc-core>=7.7      # STEP/IGES B-rep (install via conda: occt).
+#                          #   Without it, STEP/IGES import is disabled and the
+#                          #   importer accepts STL/OBJ/PLY/DXF only.
+ezdxf>=1.1                 # DXF parsing for 2D toolpaths
+networkx>=3.0              # graph ops for edge-loop / toolpath ordering
+scipy>=1.10                # Rotation, KD-trees, interpolation for trajectories
+
+# ----- Code editor niceties (optional) --------------------------------------
+QScintilla>=2.14           # rich script editor with syntax highlighting.
+Pygments>=2.17             # fallback highlighter if QScintilla is absent
