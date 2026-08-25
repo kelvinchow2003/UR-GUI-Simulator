@@ -38,9 +38,23 @@ _R_DOWN = np.array([[1.0, 0.0, 0.0],
                     [0.0, 0.0, -1.0]])
 
 
+def _rz(phi: float) -> np.ndarray:
+    """3x3 rotation about +Z by phi (radians)."""
+    c, s = np.cos(phi), np.sin(phi)
+    return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+
+
 def _pose_down(xyz) -> np.ndarray:
     """A downward-tool TCP pose at position xyz."""
     return np.concatenate([np.asarray(xyz, float), matrix_to_rotvec(_R_DOWN)])
+
+
+# Supported stacking patterns (layer-level). "column" stacks every layer
+# identically; "interlock" rotates alternate layers 90° so the vertical seams
+# between boxes don't line up, which is what gives a real palletized load its
+# stability; "brick" shifts alternate layers by half a box pitch for the same
+# reason when the boxes are too square to benefit from rotation.
+PATTERNS = ("column", "interlock", "brick")
 
 
 # ===========================================================================
@@ -53,7 +67,8 @@ class PalletSpec:
     size: np.ndarray = field(default_factory=lambda: np.array([0.8, 0.6, 0.144]))
     T: np.ndarray = field(default_factory=lambda: _default_pose())
     box_size: np.ndarray = field(default_factory=lambda: np.array([0.2, 0.15, 0.12]))
-    pattern: str = "grid"
+    box_weight_kg: float = 1.0     # per-box mass, for the payload safety check
+    pattern: str = "column"        # column | interlock | brick  ("grid" == column)
     layers: int = 3
     box_gap: float = 0.005
     layer_gap: float = 0.0
@@ -90,11 +105,11 @@ class PalletSpec:
         return max(nx, 0), max(ny, 0)
 
     def per_layer(self) -> int:
-        nx, ny = self.grid_counts()
-        return nx * ny
+        """Boxes in the first (bottom) layer for the active pattern."""
+        return len(_layer_cells(self, 0))
 
     def total_boxes(self) -> int:
-        return self.per_layer() * max(self.layers, 0)
+        return sum(len(_layer_cells(self, k)) for k in range(max(self.layers, 0)))
 
     def pallet_box(self) -> Box:
         """The pallet slab itself, as a collision/visual box.
@@ -131,34 +146,76 @@ class BoxPlacement:
 # ===========================================================================
 #  Placement generation
 # ===========================================================================
-def generate_placements(spec: PalletSpec) -> List[BoxPlacement]:
-    """Ordered box placements (bottom layer first, row-major) in the base frame."""
-    nx, ny = spec.grid_counts()
+def _grid_cells(bl, bw, L, W, gap, phi) -> List[tuple]:
+    """Row-major (x, y, yaw) box centres for a footprint (bl×bw) tiling an
+    L×W pallet with a given gap, centred, all at yaw ``phi``."""
+    nx = int(np.floor((L + gap) / (bl + gap))) if bl > 0 else 0
+    ny = int(np.floor((W + gap) / (bw + gap))) if bw > 0 else 0
     if nx <= 0 or ny <= 0:
         return []
+    span_x = nx * bl + (nx - 1) * gap
+    span_y = ny * bw + (ny - 1) * gap
+    x0 = -span_x / 2.0 + bl / 2.0
+    y0 = -span_y / 2.0 + bw / 2.0
+    return [(x0 + ix * (bl + gap), y0 + iy * (bw + gap), phi)
+            for iy in range(ny) for ix in range(nx)]
+
+
+def _layer_cells(spec: "PalletSpec", layer: int) -> List[tuple]:
+    """(x, y, yaw) box centres in the pallet plane for one layer, per pattern.
+
+    * column    — every layer identical (yaw 0).
+    * interlock — alternate layers rotated 90° (boxes and grid), so seams don't
+                  align vertically: the classic load-stabilising pattern.
+    * brick     — alternate layers shifted half a box pitch in X (wrapping boxes
+                  that fall off the edge back to the front), for square-ish boxes
+                  that don't benefit from rotation.
+    """
+    bl, bw, _ = spec.box_size
+    L, W, _ = spec.size
+    gap = spec.box_gap
+    pattern = (spec.pattern or "column").lower()
+    odd = (layer % 2 == 1)
+
+    if pattern == "interlock" and odd:
+        return _grid_cells(bw, bl, L, W, gap, np.pi / 2.0)   # box rotated 90°
+    cells = _grid_cells(bl, bw, L, W, gap, 0.0)
+    if pattern == "brick" and odd and cells:
+        pitch = bl + gap
+        half_x = L / 2.0
+        shifted = []
+        for (x, y, phi) in cells:
+            xs = x + pitch / 2.0
+            if xs + bl / 2.0 > half_x + 1e-6:          # fell off the +X edge
+                xs -= (spec.grid_counts()[0]) * pitch  # wrap to the front
+            shifted.append((xs, y, phi))
+        return shifted
+    return cells
+
+
+def generate_placements(spec: PalletSpec) -> List[BoxPlacement]:
+    """Ordered box placements (bottom layer first, row-major) in the base frame.
+
+    Each box carries its own orientation (yaw about the pallet normal) so the
+    downstream planner can rotate the wrist to set rotated boxes — required for
+    the interlock/brick stability patterns.
+    """
     bl, bw, bh = spec.box_size
     L, W, H = spec.size
     half = spec.box_size / 2.0
-    # footprint the grid actually occupies, to centre it on the pallet
-    span_x = nx * bl + (nx - 1) * spec.box_gap
-    span_y = ny * bw + (ny - 1) * spec.box_gap
-    x0 = -span_x / 2.0 + bl / 2.0
-    y0 = -span_y / 2.0 + bw / 2.0
+    R_pallet = spec.T[:3, :3]
     placements: List[BoxPlacement] = []
     idx = 0
-    for layer in range(spec.layers):
-        z = H + bh / 2.0 + layer * (bh + spec.layer_gap)     # local z (on top of slab)
-        for iy in range(ny):
-            for ix in range(nx):
-                local = np.array([x0 + ix * (bl + spec.box_gap),
-                                  y0 + iy * (bw + spec.box_gap),
-                                  z])
-                T = np.eye(4)
-                T[:3, :3] = spec.T[:3, :3]
-                T[:3, 3] = spec.T[:3, :3] @ local + spec.T[:3, 3]
-                placements.append(BoxPlacement(T=T, half=half.copy(),
-                                               layer=layer, index=idx))
-                idx += 1
+    for layer in range(max(spec.layers, 0)):
+        z = H + bh / 2.0 + layer * (bh + spec.layer_gap)     # local z (on slab top)
+        for (x, y, phi) in _layer_cells(spec, layer):
+            local = np.array([x, y, z])
+            T = np.eye(4)
+            T[:3, :3] = R_pallet @ _rz(phi)                  # per-box yaw
+            T[:3, 3] = R_pallet @ local + spec.T[:3, 3]
+            placements.append(BoxPlacement(T=T, half=half.copy(),
+                                           layer=layer, index=idx))
+            idx += 1
     return placements
 
 
@@ -237,26 +294,31 @@ class PalletJob:
     # ---- carried-box geometry (in the TCP frame) -------------------------
     def _carried_local(self) -> Tuple[np.ndarray, np.ndarray]:
         """
-        The gripped box expressed in the TCP frame — constant for every box
-        since the grip point, box orientation and (downward) tool orientation
-        are all constant. Derived so the touch point sits exactly at the TCP.
+        The gripped box expressed in the TCP frame — constant for every box.
+
+        Because the wrist yaws to match each box (see :meth:`_place_pose`), the
+        box's pose *relative to the tool* is identical no matter how the box is
+        rotated in its layer::
+
+            R_tool = R_box · R_down   ⇒   R_box in tool frame = R_downᵀ
+            tcp = box_centre + R_box·gp  ⇒  centre − tcp (tool frame) = −R_downᵀ·gp
         """
         half = self.spec.box_size / 2.0
         gp = self.spec.grip_point_local()            # box-local contact point
-        R_box = self.spec.T[:3, :3]
-        # box centre relative to the TCP, in the (downward) tool frame:
-        #   tcp_world = box_centre + R_box @ gp  ⇒  box_centre - tcp = -R_box @ gp
-        t = _R_DOWN.T @ (-(R_box @ gp))
         local = np.eye(4)
-        local[:3, :3] = _R_DOWN.T @ R_box
-        local[:3, 3] = t
+        local[:3, :3] = _R_DOWN.T
+        local[:3, 3] = -_R_DOWN.T @ gp
         return local, half
 
     def _place_pose(self, place: BoxPlacement) -> np.ndarray:
-        """TCP pose to set a box down: tool at the box's grip point, pointing down."""
+        """TCP pose to set a box down: tool at the box's grip point, pointing
+        down but **yawed to match the box** so a rotated box in an interlock or
+        brick layer is set with the gripper aligned to it."""
         gp = self.spec.grip_point_local()
         contact = place.T[:3, 3] + place.T[:3, :3] @ gp
-        pose = np.eye(4); pose[:3, :3] = _R_DOWN; pose[:3, 3] = contact
+        pose = np.eye(4)
+        pose[:3, :3] = place.T[:3, :3] @ _R_DOWN     # down, yawed with the box
+        pose[:3, 3] = contact
         return matrix_to_pose(pose)
 
     @staticmethod
@@ -350,6 +412,19 @@ class PalletJob:
                               "larger than the pallet (or the gaps are too large). "
                               "Increase the pallet size or reduce the box/gaps.")
             return [], np.asarray([self.q_start], float), {}, report
+
+        # Payload safety: a box heavier than the robot's rated payload can't be
+        # lifted no matter how reachable the pose is. Checked up front and folded
+        # into the final verdict.
+        payload = float(getattr(self.kin.model, "payload_kg", 0.0) or 0.0)
+        payload_ok = not (payload > 0 and self.spec.box_weight_kg > payload)
+        payload_msg = ""
+        if not payload_ok:
+            payload_msg = (f"⚠ Box mass {self.spec.box_weight_kg:.1f} kg exceeds the "
+                           f"{self.kin.model.name} rated payload {payload:.0f} kg "
+                           f"(before gripper mass) — use a bigger robot or lighter "
+                           f"boxes.")
+
         steps: List[ProgramStep] = []
         sim: List[np.ndarray] = [self.q_start.copy()]
         events: Dict[int, tuple] = {}
@@ -472,8 +547,14 @@ class PalletJob:
             seed = q_place_clear
 
         if report.ok:
-            report.message = (f"All {len(placements)} boxes reachable and "
-                              f"collision-free ({self.spec.layers} layers).")
+            report.message = (
+                f"All {len(placements)} boxes reachable and collision-free "
+                f"({self.spec.layers} layers, {self.spec.pattern} pattern).")
+        # Payload overrides geometry: a reachable path you can't lift isn't runnable.
+        if not payload_ok:
+            report.ok = False
+            report.message = (payload_msg if report.first_failure < 0
+                              else payload_msg + "  Also: " + report.message)
         return steps, np.asarray(sim, float), events, report
 
     def _failure_message(self, k: int, place: "BoxPlacement", st: "BoxStatus") -> str:

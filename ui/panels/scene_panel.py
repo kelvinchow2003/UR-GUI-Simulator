@@ -115,70 +115,96 @@ class ScenePanel(QWidget):
         self.pallet_list.currentRowChanged.connect(self._load_pallet_to_form)
         pg.addWidget(self.pallet_list, 0, 0, 1, 4)
 
-        pg.addWidget(QLabel("Pallet L×W×H (mm)"), 1, 0)
+        # standard pallet presets (ISO / GMA footprints)
+        pg.addWidget(QLabel("Standard"), 1, 0)
+        self.preset_box = QComboBox()
+        self._pallet_presets = {
+            "Custom": None,
+            "EUR / EPAL 1  (1200×800×144)": (1200, 800, 144),
+            "EUR 6 half   (800×600×144)": (800, 600, 144),
+            "US GMA       (1219×1016×144)": (1219, 1016, 144),
+            "Industrial   (1200×1000×144)": (1200, 1000, 144),
+        }
+        self.preset_box.addItems(list(self._pallet_presets.keys()))
+        self.preset_box.setToolTip("Load a standard pallet footprint, then set "
+                                   "box size / pattern / layers.")
+        self.preset_box.currentTextChanged.connect(self._apply_pallet_preset)
+        pg.addWidget(self.preset_box, 1, 1, 1, 3)
+
+        pg.addWidget(QLabel("Pallet L×W×H (mm)"), 2, 0)
         self.pl_l = _spin(50, 5000, 800); self.pl_w = _spin(50, 5000, 600)
         self.pl_h = _spin(1, 2000, 144)
-        pg.addWidget(self.pl_l, 1, 1); pg.addWidget(self.pl_w, 1, 2)
-        pg.addWidget(self.pl_h, 1, 3)
+        pg.addWidget(self.pl_l, 2, 1); pg.addWidget(self.pl_w, 2, 2)
+        pg.addWidget(self.pl_h, 2, 3)
 
-        pg.addWidget(QLabel("Box L×W×H (mm)"), 2, 0)
+        pg.addWidget(QLabel("Box L×W×H (mm) · kg"), 3, 0)
         self.bx_l = _spin(1, 2000, 200); self.bx_w = _spin(1, 2000, 150)
         self.bx_h = _spin(1, 2000, 120)
-        pg.addWidget(self.bx_l, 2, 1); pg.addWidget(self.bx_w, 2, 2)
-        pg.addWidget(self.bx_h, 2, 3)
+        self.bx_kg = _spin(0.0, 2000.0, 1.0, dec=1, step=0.5, suffix=" kg")
+        self.bx_kg.setToolTip("Mass of one box — checked against the robot's "
+                              "rated payload.")
+        boxrow = QHBoxLayout()
+        for w in (self.bx_l, self.bx_w, self.bx_h, self.bx_kg):
+            boxrow.addWidget(w)
+        pg.addLayout(boxrow, 3, 1, 1, 3)
 
-        pg.addWidget(QLabel("Pattern / layers"), 3, 0)
-        self.pattern_box = QComboBox(); self.pattern_box.addItems(["grid"])
-        pg.addWidget(self.pattern_box, 3, 1)
+        pg.addWidget(QLabel("Pattern / layers"), 4, 0)
+        self.pattern_box = QComboBox()
+        self.pattern_box.addItems(["column", "interlock", "brick"])
+        self.pattern_box.setToolTip(
+            "column = straight stack · interlock = alternate layers rotated 90° "
+            "for a stable load · brick = alternate layers offset half a box.")
+        pg.addWidget(self.pattern_box, 4, 1)
         self.layers = QSpinBox(); self.layers.setRange(1, 50); self.layers.setValue(3)
-        pg.addWidget(QLabel("layers"), 3, 2); pg.addWidget(self.layers, 3, 3)
+        pg.addWidget(QLabel("layers"), 4, 2); pg.addWidget(self.layers, 4, 3)
 
-        pg.addWidget(QLabel("Gaps box/layer (mm)"), 4, 0)
+        pg.addWidget(QLabel("Gaps box/layer (mm)"), 5, 0)
         self.box_gap = _spin(0, 500, 5); self.layer_gap = _spin(0, 500, 0)
-        pg.addWidget(self.box_gap, 4, 1); pg.addWidget(self.layer_gap, 4, 2)
+        pg.addWidget(self.box_gap, 5, 1); pg.addWidget(self.layer_gap, 5, 2)
 
         grip_lbl = QLabel("Grip/touch pt X/Y/Z (mm, box-local; blank=top)")
         grip_lbl.setToolTip("The point on each box where the tool touches/grips it, "
                             "measured from the box centre in the box's own frame. "
                             "Default is the top-face centre.")
-        pg.addWidget(grip_lbl, 5, 0, 1, 2)
+        pg.addWidget(grip_lbl, 6, 0, 1, 2)
         self.grip_top = QPushButton("Top-centre")
         self.grip_top.setCheckable(True); self.grip_top.setChecked(True)
         self.grip_top.setToolTip("On = grip each box at its top-face centre. "
                                  "Off = set a custom touch point below.")
         self.grip_top.toggled.connect(self._grip_top_toggled)
-        pg.addWidget(self.grip_top, 5, 2)
+        pg.addWidget(self.grip_top, 6, 2)
         self.gp_x = _spin(-1000, 1000, 0); self.gp_y = _spin(-1000, 1000, 0)
         self.gp_z = _spin(-1000, 1000, 60)
         gr = QHBoxLayout(); gr.addWidget(self.gp_x); gr.addWidget(self.gp_y)
         gr.addWidget(self.gp_z)
-        pg.addLayout(gr, 6, 0, 1, 4)
+        pg.addLayout(gr, 7, 0, 1, 4)
         for s in (self.gp_x, self.gp_y, self.gp_z):
             s.setEnabled(False)
 
-        pg.addWidget(QLabel("Pallet pos X/Y/Z (mm) + yaw°"), 7, 0)
+        pg.addWidget(QLabel("Pallet pos X/Y/Z (mm) + yaw°"), 8, 0)
         self.pp_x = _spin(-3000, 3000, 600); self.pp_y = _spin(-3000, 3000, 0)
         self.pp_z = _spin(-3000, 3000, 0); self.pp_yaw = _spin(-180, 180, 0, dec=1, step=5)
-        pg.addWidget(self.pp_x, 7, 1); pg.addWidget(self.pp_y, 7, 2)
-        pg.addWidget(self.pp_z, 7, 3)
-        pg.addWidget(QLabel("yaw°"), 8, 0); pg.addWidget(self.pp_yaw, 8, 1)
+        pg.addWidget(self.pp_x, 8, 1); pg.addWidget(self.pp_y, 8, 2)
+        pg.addWidget(self.pp_z, 8, 3)
+        pg.addWidget(QLabel("yaw°"), 9, 0); pg.addWidget(self.pp_yaw, 9, 1)
         move_btn = QPushButton("Apply move to selected")
         move_btn.clicked.connect(self._apply_move)
-        pg.addWidget(move_btn, 8, 2, 1, 2)
+        pg.addWidget(move_btn, 9, 2, 1, 2)
 
         self.fit_lbl = QLabel("—")
         self.fit_lbl.setStyleSheet("color:#4c566a;font-size:10px")
-        pg.addWidget(self.fit_lbl, 9, 0, 1, 4)
+        pg.addWidget(self.fit_lbl, 10, 0, 1, 4)
         for s in (self.pl_l, self.pl_w, self.bx_l, self.bx_w, self.box_gap):
             s.valueChanged.connect(self._update_fit)
         self.layers.valueChanged.connect(self._update_fit)
+        self.pattern_box.currentTextChanged.connect(self._update_fit)
 
         starter = QPushButton("★ Add starter pallet fitted to this robot")
         starter.setStyleSheet("background:#a3be8c;font-weight:bold;padding:5px")
         starter.setToolTip("One click: adds a ready-to-run pallet sized and placed "
                            "to fit THIS robot's reach, so Simulate works immediately.")
         starter.clicked.connect(self._add_starter_pallet)
-        pg.addWidget(starter, 10, 0, 1, 4)
+        pg.addWidget(starter, 11, 0, 1, 4)
 
         prow = QHBoxLayout()
         for label, fn in (("Add pallet", self._add_pallet),
@@ -186,7 +212,7 @@ class ScenePanel(QWidget):
                           ("Copy/Paste", self._copy_pallet),
                           ("Delete", self._del_pallet)):
             b = QPushButton(label); b.clicked.connect(fn); prow.addWidget(b)
-        pg.addLayout(prow, 11, 0, 1, 4)
+        pg.addLayout(prow, 12, 0, 1, 4)
         root.addWidget(pl)
 
         # ---------- palletize / simulate ----------
@@ -290,6 +316,14 @@ class ScenePanel(QWidget):
         for s in (self.gp_x, self.gp_y, self.gp_z):
             s.setEnabled(not on)
 
+    def _apply_pallet_preset(self, text: str) -> None:
+        dims = self._pallet_presets.get(text)
+        if dims is None:
+            return
+        self.pl_l.setValue(dims[0]); self.pl_w.setValue(dims[1]); self.pl_h.setValue(dims[2])
+        self.report_lbl.setText(f"Loaded {text.split('(')[0].strip()} footprint. "
+                                f"Set box size / pattern / layers, then Simulate.")
+
     def _spec_from_form(self) -> PalletSpec:
         size = np.array([self.pl_l.value(), self.pl_w.value(), self.pl_h.value()]) / 1000
         box = np.array([self.bx_l.value(), self.bx_w.value(), self.bx_h.value()]) / 1000
@@ -302,6 +336,7 @@ class ScenePanel(QWidget):
                 else np.array([self.gp_x.value(), self.gp_y.value(),
                                self.gp_z.value()]) / 1000)
         return PalletSpec(name="Pallet", size=size, T=T, box_size=box,
+                          box_weight_kg=self.bx_kg.value(),
                           layers=self.layers.value(),
                           box_gap=self.box_gap.value() / 1000,
                           layer_gap=self.layer_gap.value() / 1000,
@@ -315,6 +350,11 @@ class ScenePanel(QWidget):
         self.pl_h.setValue(s.size[2] * 1000)
         self.bx_l.setValue(s.box_size[0] * 1000); self.bx_w.setValue(s.box_size[1] * 1000)
         self.bx_h.setValue(s.box_size[2] * 1000)
+        self.bx_kg.setValue(float(getattr(s, "box_weight_kg", 1.0)))
+        pat = "column" if s.pattern in ("grid", "column") else s.pattern
+        j = self.pattern_box.findText(pat)
+        if j >= 0:
+            self.pattern_box.setCurrentIndex(j)
         self.layers.setValue(s.layers)
         self.box_gap.setValue(s.box_gap * 1000); self.layer_gap.setValue(s.layer_gap * 1000)
         self.pp_x.setValue(s.T[0, 3] * 1000); self.pp_y.setValue(s.T[1, 3] * 1000)
@@ -355,6 +395,12 @@ class ScenePanel(QWidget):
                           (self.pp_z, d["pos"][2]), (self.pick_x, d["pick"][0]),
                           (self.pick_y, d["pick"][1]), (self.pick_z, d["pick"][2])):
             spin.setValue(val * 1000.0)
+        # a realistic demo box mass that stays within the robot's payload
+        try:
+            payload = float(self.kin.model.payload_kg)
+        except Exception:                              # noqa: BLE001
+            payload = 5.0
+        self.bx_kg.setValue(round(max(0.5, payload * 0.4), 1))
 
     def _add_starter_pallet(self) -> None:
         """One-click: reach-fitted pallet added and ready to Simulate."""
@@ -417,9 +463,14 @@ class ScenePanel(QWidget):
     def _update_fit(self) -> None:
         spec = self._spec_from_form()
         nx, ny = spec.grid_counts()
-        self.fit_lbl.setText(
-            f"Fits {nx}×{ny} = {nx*ny} boxes/layer, "
-            f"{nx*ny*spec.layers} total over {spec.layers} layer(s).")
+        total = spec.total_boxes()
+        base = (f"Fits {nx}×{ny} = {nx*ny} boxes/base layer, "
+                f"{total} total over {spec.layers} layer(s).")
+        if spec.pattern == "interlock":
+            base += "  Interlock rotates alternate layers 90°."
+        elif spec.pattern == "brick":
+            base += "  Brick offsets alternate layers half a box."
+        self.fit_lbl.setText(base)
 
     # ---- palletize --------------------------------------------------------
     def _current_spec(self):
