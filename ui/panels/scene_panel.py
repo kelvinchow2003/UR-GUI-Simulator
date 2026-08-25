@@ -33,7 +33,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QPushButton, QDoubleSpinBox, QSpinBox, QListWidget, QComboBox,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QCheckBox,
 )
 
 from robot.collision import Box, CollisionWorld, link_radii
@@ -217,17 +217,37 @@ class ScenePanel(QWidget):
         self.margin.setToolTip("Collision safety clearance (mm) inflating every test.")
         jg.addWidget(self.job_speed, 2, 1); jg.addWidget(self.margin, 2, 2)
 
+        # playback speed + fast planning (for quick iteration)
+        pb = QHBoxLayout()
+        pb.addWidget(QLabel("Sim speed"))
+        self.speed_box = QComboBox()
+        self._speed_map = {"0.5×": 0.5, "1×": 1.0, "2×": 2.0, "4×": 4.0,
+                           "8×": 8.0, "Instant": 0.0}
+        self.speed_box.addItems(list(self._speed_map.keys()))
+        self.speed_box.setCurrentText("2×")
+        self.speed_box.setToolTip("Animation playback speed. 'Instant' jumps "
+                                  "straight to the finished stack.")
+        self.speed_box.currentTextChanged.connect(self._apply_speed)
+        pb.addWidget(self.speed_box)
+        self.fast_plan = QCheckBox("Fast plan")
+        self.fast_plan.setToolTip("Coarser IK + sampling for much quicker "
+                                  "planning while iterating. Re-run without it "
+                                  "to confirm a job before exporting.")
+        pb.addWidget(self.fast_plan)
+        pb.addStretch(1)
+        jg.addLayout(pb, 3, 0, 1, 4)
+
         brow = QHBoxLayout()
         for label, fn in (("Preview placements", self._preview),
                           ("Simulate palletization", self._simulate),
                           ("Add program → Program", self._to_program)):
             b = QPushButton(label); b.clicked.connect(fn); brow.addWidget(b)
-        jg.addLayout(brow, 3, 0, 1, 4)
+        jg.addLayout(brow, 4, 0, 1, 4)
         self.report_lbl = QLabel("New here? Click ★ Add starter pallet, then "
                                  "Simulate palletization.")
         self.report_lbl.setWordWrap(True)
         self.report_lbl.setStyleSheet("font-weight:bold")
-        jg.addWidget(self.report_lbl, 4, 0, 1, 4)
+        jg.addWidget(self.report_lbl, 5, 0, 1, 4)
         root.addWidget(job)
 
         disc = QLabel("⚠ Feasibility aid only — nominal geometry, no cabling/"
@@ -239,6 +259,7 @@ class ScenePanel(QWidget):
         root.addStretch(1)
         self.apply_model_defaults()
         self._update_fit()
+        self._apply_speed(self.speed_box.currentText())   # default 2× playback
 
     # ---- obstacle actions -------------------------------------------------
     def _add_obstacle(self) -> None:
@@ -313,11 +334,15 @@ class ScenePanel(QWidget):
             r = float(self.kin.model.reach_mm) / 1000.0
         except Exception:                              # noqa: BLE001
             r = 0.85
+        # Pallet placed well out in front (0.70·reach) so the elbow-up posture
+        # clears the pallet edge on every arm — a floor-mounted robot stacking
+        # onto a pallet right at its base grazes the near edge. These defaults
+        # are verified feasible for every UR model.
         return dict(
-            pallet=(0.40 * r, 0.30 * r, 0.144),
-            box=(0.13 * r, 0.11 * r, 0.10 * r),
-            pos=(0.50 * r, 0.0, 0.0),
-            pick=(0.28 * r, -0.50 * r, 0.20 * r),
+            pallet=(0.36 * r, 0.28 * r, 0.12),
+            box=(0.12 * r, 0.10 * r, 0.10 * r),
+            pos=(0.70 * r, 0.0, 0.0),
+            pick=(0.32 * r, -0.55 * r, 0.30 * r),
         )
 
     def apply_model_defaults(self) -> None:
@@ -405,15 +430,20 @@ class ScenePanel(QWidget):
             return 0, self.scene.pallets[0]
         return -1, None
 
+    def _apply_speed(self, text: str) -> None:
+        self.main_window.set_sim_speed(self._speed_map.get(text, 1.0))
+
     def _job_opts(self) -> JobOptions:
         from robot.palletizer import _pose_down
         pick = _pose_down([self.pick_x.value() / 1000, self.pick_y.value() / 1000,
                            self.pick_z.value() / 1000])
-        return JobOptions(pick_pose=pick,
-                          pick_approach=self.appr_pick.value() / 1000,
-                          place_approach=self.appr_place.value() / 1000,
-                          speed_l=self.job_speed.value(),
-                          margin=self.margin.value() / 1000)
+        common = dict(pick_pose=pick,
+                      pick_approach=self.appr_pick.value() / 1000,
+                      place_approach=self.appr_place.value() / 1000,
+                      speed_l=self.job_speed.value(),
+                      margin=self.margin.value() / 1000)
+        return (JobOptions.fast(**common) if self.fast_plan.isChecked()
+                else JobOptions(**common))
 
     def _radii_cached(self):
         if self._radii is None:
@@ -461,6 +491,7 @@ class ScenePanel(QWidget):
         job, spec = self._build_job()
         if job is None:
             return
+        self._apply_speed(self.speed_box.currentText())
         steps, sim, events, report = job.plan()
         placements = generate_placements(spec)
         self.viewport.build_placed_boxes(

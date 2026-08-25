@@ -95,6 +95,7 @@ class MainWindow(QMainWindow):
         self._anim_index = 0
         self._anim_events: dict = {}
         self._anim_stride = 1
+        self._sim_speed = 1.0          # playback speed multiplier (user-set)
         self._carried_local = None
         self._carried_half = None
         self._render_timer = QTimer(self)
@@ -262,8 +263,21 @@ class MainWindow(QMainWindow):
     # ---- render / animation ----------------------------------------------
     @staticmethod
     def _playback_stride(n: int) -> int:
-        # keep total playback to roughly 600 frames (~20 s at 30 fps)
-        return max(1, n // 600)
+        # keep 1x playback to roughly 450 frames (~15 s at 30 fps)
+        return max(1, n // 450)
+
+    def set_sim_speed(self, factor: float) -> None:
+        """Set the animation playback speed multiplier (0 ⇒ jump to the end).
+
+        Applied live in :meth:`_render_tick`, so it takes effect mid-playback —
+        handy for fast-forwarding a long palletizing run while testing.
+        """
+        self._sim_speed = max(0.0, float(factor))
+
+    def _effective_stride(self) -> int:
+        if self._sim_speed <= 0.0:                 # "Instant"
+            return max(1, len(self._anim_path)) if self._anim_path is not None else 1
+        return max(1, int(round(self._anim_stride * self._sim_speed)))
 
     def _start_animation(self, q_path: np.ndarray) -> None:
         self._anim_path = np.asarray(q_path)
@@ -305,7 +319,7 @@ class MainWindow(QMainWindow):
             return
         if self._anim_path is not None:
             n = len(self._anim_path)
-            stride = self._anim_stride
+            stride = self._effective_stride()
             i = self._anim_index
             # apply every timeline event in the frames we're about to skip over
             for j in range(i, min(i + stride, n)):
