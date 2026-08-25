@@ -161,6 +161,13 @@ class RobotViewport(QWidget):
         self._cad_actor = None
         self._path_actors: List = []
         self._frame_actors: List = []
+        self._edit_actors: List = []          # Path Editor overlay (markers/line/triads)
+        self._workplane_actor = None          # Path Editor free-space work plane
+        self._scene_actors: List = []         # obstacles + pallet slabs
+        self._scene_meta: List = []           # [(actor, ref)] for click-picking
+        self._placed_actors: List = []        # pallet boxes (revealed as stacked)
+        self._carried_actor = None            # box currently in the gripper
+        self._carried_half = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -428,8 +435,17 @@ class RobotViewport(QWidget):
         except Exception:                       # noqa: BLE001
             pass
 
+    # ---- interactor / picking accessors (used by the Path Editor) ---------
+    def interactor(self):
+        """Public wrapper over the underlying vtkRenderWindowInteractor."""
+        return self._vtk_interactor()
+
+    def cad_actor(self):
+        """Return the current CAD actor (for cell-picking), or None."""
+        return self._cad_actor
+
     # ---- CAD overlay ------------------------------------------------------
-    def show_cad(self, cad) -> None:
+    def show_cad(self, cad, pickable: bool = False) -> None:
         if not _HAVE_PV:
             return
         if self._cad_actor is not None:
@@ -444,14 +460,14 @@ class RobotViewport(QWidget):
                 mesh = pv.PolyData(cad.vertices, faces)
                 self._cad_actor = self.plotter.add_mesh(
                     mesh, color="#b48ead", opacity=0.55, smooth_shading=True,
-                    name="cad", pickable=False, reset_camera=False)
+                    name="cad", pickable=pickable, reset_camera=False)
             elif cad.polylines:
                 blocks = pv.MultiBlock()
                 for poly in cad.polylines:
                     blocks.append(pv.lines_from_points(poly))
                 self._cad_actor = self.plotter.add_mesh(
                     blocks.combine(), color="#b48ead", line_width=2,
-                    name="cad", pickable=False, reset_camera=False)
+                    name="cad", pickable=pickable, reset_camera=False)
             self.plotter.reset_camera()
         except Exception:                       # noqa: BLE001
             pass
@@ -503,6 +519,230 @@ class RobotViewport(QWidget):
                     arrow, color=color, name=f"pf{i}_{axis}",
                     pickable=False, reset_camera=False))
         self.plotter.render()
+
+    # ---- Path Editor overlay ---------------------------------------------
+    def draw_waypoints(self, pts, selected: int = -1, orient_mats=None,
+                       colors=None) -> None:
+        """
+        Render an *editable* path preview: a sphere per waypoint, a polyline
+        joining them, the selected point emphasised, and optional TCP
+        orientation triads. Kept separate from :meth:`show_toolpath` so the
+        two overlays never fight over actor names.
+        """
+        for a in self._edit_actors:
+            self._safe_remove(a)
+        self._edit_actors.clear()
+        if not _HAVE_PV:
+            return
+        pts = np.asarray(pts, float).reshape(-1, 3) if pts is not None \
+            else np.empty((0, 3))
+        if len(pts) >= 2:
+            line = pv.lines_from_points(pts)
+            self._edit_actors.append(self.plotter.add_mesh(
+                line, color="#5e81ac", line_width=3, name="edit_line",
+                pickable=False, reset_camera=False))
+        # per-point spheres (reachable=teal, unreachable=red, selected=orange)
+        for i, p in enumerate(pts):
+            if i == selected:
+                col = "#d08770"
+            elif colors is not None and i < len(colors):
+                col = colors[i]
+            else:
+                col = "#88c0d0"
+            r = 0.012 if i == selected else 0.009
+            sph = pv.Sphere(radius=r, center=p)
+            self._edit_actors.append(self.plotter.add_mesh(
+                sph, color=col, name=f"edit_pt{i}", pickable=False,
+                reset_camera=False))
+            try:
+                self._edit_actors.append(self.plotter.add_point_labels(
+                    np.array([p]), [str(i + 1)], font_size=11,
+                    text_color="#2e3440", show_points=False, shape=None,
+                    name=f"edit_lbl{i}", reset_camera=False))
+            except Exception:               # noqa: BLE001
+                pass
+        # orientation triads (small)
+        if orient_mats is not None:
+            for i, T in enumerate(orient_mats):
+                o = np.asarray(T)[:3, 3]
+                for axis, color in zip(range(3), ("red", "green", "blue")):
+                    arrow = pv.Arrow(start=o, direction=np.asarray(T)[:3, axis],
+                                     scale=0.03)
+                    self._edit_actors.append(self.plotter.add_mesh(
+                        arrow, color=color, name=f"edit_tri{i}_{axis}",
+                        pickable=False, reset_camera=False))
+        self.plotter.render()
+
+    def show_work_plane(self, point, normal, size: float = 1.0) -> None:
+        """Draw / update the translucent work plane free-space clicks land on."""
+        if self._workplane_actor is not None:
+            self._safe_remove(self._workplane_actor)
+            self._workplane_actor = None
+        if not _HAVE_PV or point is None:
+            if _HAVE_PV:
+                self.plotter.render()
+            return
+        try:
+            plane = pv.Plane(center=np.asarray(point, float),
+                             direction=np.asarray(normal, float),
+                             i_size=size, j_size=size,
+                             i_resolution=10, j_resolution=10)
+            self._workplane_actor = self.plotter.add_mesh(
+                plane, color="#a3be8c", opacity=0.12, name="workplane",
+                pickable=False, reset_camera=False)
+            # a wireframe edge so the plane reads clearly
+            self.plotter.add_mesh(plane, style="wireframe", color="#a3be8c",
+                                  opacity=0.35, line_width=1, name="workplane_wire",
+                                  pickable=False, reset_camera=False)
+        except Exception:                       # noqa: BLE001
+            pass
+        self.plotter.render()
+
+    # ---- Scene: collision boxes / pallets / palletized boxes --------------
+    def _add_box(self, T, half, color, opacity, name, visible=True):
+        half = np.asarray(half, float)
+        cube = pv.Cube(center=(0, 0, 0), x_length=2 * half[0],
+                       y_length=2 * half[1], z_length=2 * half[2])
+        actor = self.plotter.add_mesh(
+            cube, color=color, opacity=opacity, name=name, pickable=False,
+            reset_camera=False, show_edges=True, edge_color="#2e3440",
+            line_width=1)
+        self._set_matrix(actor, np.asarray(T, float))
+        if not visible:
+            try:
+                actor.SetVisibility(False)
+            except Exception:                   # noqa: BLE001
+                pass
+        return actor
+
+    def set_scene_boxes(self, specs) -> None:
+        """Render static obstacles + pallet slabs. ``specs``: dicts with
+        T, half, color, opacity, name, optional ref + ``selected``. Rebuilt on
+        each scene edit; a selected box is highlighted and its ref recorded so
+        clicks in the 3D view map back to the scene item."""
+        for a in self._scene_actors:
+            self._safe_remove(a)
+        self._scene_actors.clear()
+        self._scene_meta.clear()
+        if not _HAVE_PV:
+            return
+        for i, s in enumerate(specs or []):
+            sel = bool(s.get("selected", False))
+            opacity = s.get("opacity", 0.35)
+            actor = self._add_box(
+                s["T"], s["half"], s.get("color", "#bf616a"),
+                min(0.85, opacity + 0.25) if sel else opacity, f"scene_{i}")
+            if sel:
+                try:
+                    actor.prop.edge_color = "#ebcb8b"
+                    actor.prop.line_width = 3
+                except Exception:               # noqa: BLE001
+                    pass
+            self._scene_actors.append(actor)
+            self._scene_meta.append((actor, s.get("ref")))
+        self.plotter.render()
+
+    def scene_pick(self, x, y):
+        """Return the ref of the scene box under display coords (x, y), or None."""
+        if not _HAVE_PV or not self._scene_meta:
+            return None
+        try:
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(0.005)
+            picker.PickFromListOn()
+            picker.InitializePickList()
+            for a, _ref in self._scene_meta:
+                picker.AddPickList(a)
+            if picker.Pick(x, y, 0, self.plotter.renderer) and \
+                    picker.GetActor() is not None:
+                addr = picker.GetActor().GetAddressAsString("")
+                for a, ref in self._scene_meta:
+                    if a.GetAddressAsString("") == addr:
+                        return ref
+        except Exception:                       # noqa: BLE001
+            return None
+        return None
+
+    def update_scene_actor(self, ref, T) -> None:
+        """Re-pose a single scene box (used for smooth drag without a rebuild)."""
+        if not _HAVE_PV:
+            return
+        for a, r in self._scene_meta:
+            if r == ref:
+                self._set_matrix(a, np.asarray(T, float))
+                self.plotter.render()
+                return
+
+    def world_ray(self, x, y):
+        """Two world points (near, far) along the click ray at display (x, y)."""
+        ren = self.plotter.renderer
+        ren.SetDisplayPoint(x, y, 0.0); ren.DisplayToWorld()
+        w0 = np.array(ren.GetWorldPoint(), float)
+        ren.SetDisplayPoint(x, y, 1.0); ren.DisplayToWorld()
+        w1 = np.array(ren.GetWorldPoint(), float)
+        p0 = w0[:3] / (w0[3] if abs(w0[3]) > 1e-12 else 1.0)
+        p1 = w1[:3] / (w1[3] if abs(w1[3]) > 1e-12 else 1.0)
+        return p0, p1
+
+    def camera_horizontal_normal(self):
+        """Unit horizontal view direction (for a vertical drag plane)."""
+        try:
+            d = np.asarray(self.plotter.camera.direction, float)
+        except Exception:                       # noqa: BLE001
+            d = np.array([1.0, 0.0, 0.0])
+        d[2] = 0.0
+        n = np.linalg.norm(d)
+        return d / n if n > 1e-6 else np.array([1.0, 0.0, 0.0])
+
+    def build_placed_boxes(self, placements, color="#c9a06a") -> None:
+        """Create (hidden) actors for every pallet box, to reveal during play."""
+        for a in self._placed_actors:
+            self._safe_remove(a)
+        self._placed_actors.clear()
+        if not _HAVE_PV:
+            return
+        for i, pl in enumerate(placements or []):
+            T = pl["T"] if isinstance(pl, dict) else pl.T
+            half = pl["half"] if isinstance(pl, dict) else pl.half
+            self._placed_actors.append(
+                self._add_box(T, half, color, 0.92, f"placed_{i}", visible=False))
+        self.plotter.render()
+
+    def set_placed_visible(self, n) -> None:
+        if not _HAVE_PV:
+            return
+        for i, a in enumerate(self._placed_actors):
+            try:
+                a.SetVisibility(i < n)
+            except Exception:                   # noqa: BLE001
+                pass
+        self.plotter.render()
+
+    def set_carried_box(self, T, half=None) -> None:
+        """Re-pose (or create/remove) the box currently held at the TCP."""
+        if not _HAVE_PV:
+            return
+        if T is None or half is None:
+            if self._carried_actor is not None:
+                self._safe_remove(self._carried_actor)
+                self._carried_actor = None
+                self._carried_half = None
+                self.plotter.render()
+            return
+        half = np.asarray(half, float)
+        if (self._carried_actor is None or self._carried_half is None
+                or not np.allclose(half, self._carried_half)):
+            if self._carried_actor is not None:
+                self._safe_remove(self._carried_actor)
+            self._carried_actor = self._add_box(np.eye(4), half, "#a3be8c",
+                                                0.92, "carried")
+            self._carried_half = half
+        self._set_matrix(self._carried_actor, np.asarray(T, float))
+        self.plotter.render()
+
+    def clear_pallet_animation(self) -> None:
+        self.set_carried_box(None)
+        self.set_placed_visible(0)
 
     def reset_view(self) -> None:
         if _HAVE_PV:

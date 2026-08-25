@@ -8,7 +8,7 @@
 # ============================================================================
 
 # ----- Core GUI (REQUIRED) --------------------------------------------------
-PySide6>=6.6,<6.9          # Qt 6 bindings — main window, docks, widgets
+PySide6>=6.10    # Qt 6 bindings — main window, docks, widgets
 numpy>=1.24                # linear algebra everywhere (poses, DH, transforms)
 
 # ----- Robot communication (recommended) ------------------------------------

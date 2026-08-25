@@ -44,8 +44,13 @@ class ProgramPanel(QWidget):
         self.program = program
         self.jog = jog_panel
         self.kin = kin
+        self._collision_checker = None
         self._build()
         self.refresh()
+
+    def set_collision_checker(self, fn) -> None:
+        """fn(q_path) -> (index, CollisionResult|None); index<0 means clear."""
+        self._collision_checker = fn
 
     # ---- UI ---------------------------------------------------------------
     def _build(self) -> None:
@@ -140,6 +145,16 @@ class ProgramPanel(QWidget):
         self.refresh()
         self.program_changed.emit()
         self.status.emit(f"Added {len(poses)} process points from toolpath.")
+
+    def add_program_steps(self, steps) -> None:
+        """Append pre-built ProgramStep objects (e.g. from the Path Editor)."""
+        steps = list(steps)
+        if not steps:
+            return
+        self.program.steps.extend(steps)
+        self.refresh()
+        self.program_changed.emit()
+        self.status.emit(f"Added {len(steps)} step(s) from Path Editor.")
 
     def _add(self, step: ProgramStep) -> None:
         idx = self._selected_index()
@@ -298,6 +313,16 @@ class ProgramPanel(QWidget):
         bad = sum(1 for q in path if not self.kin.in_limits(q))
         if bad:
             self.status.emit(f"⚠ {bad} sample(s) exceed joint limits.")
+        # collision check against the scene, if one is wired in
+        if self._collision_checker is not None:
+            try:
+                idx, res = self._collision_checker(path)
+            except Exception:                              # noqa: BLE001
+                idx, res = -1, None
+            if idx is not None and idx >= 0 and res is not None:
+                self.status.emit(
+                    f"⚠ Collision at sample {idx}/{len(path)}: "
+                    f"{res.link} ↔ {res.box}.")
         self.simulate_requested.emit(path)
         self.status.emit(f"Simulating {len(path)} trajectory samples…")
 

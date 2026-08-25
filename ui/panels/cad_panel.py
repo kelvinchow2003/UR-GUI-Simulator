@@ -47,6 +47,16 @@ class CADPanel(QWidget):
     def _build(self) -> None:
         root = QVBoxLayout(self)
 
+        # create-path launcher (prominent, top of the dock)
+        self.create_path_btn = QPushButton("✏  Create Path with CAD  →")
+        self.create_path_btn.setStyleSheet(
+            "background:#5e81ac;color:white;font-weight:bold;padding:8px")
+        self.create_path_btn.setToolTip(
+            "Open the Path Editor to draw a robot toolpath by clicking on the "
+            "CAD (and in free space around it), then export it as URScript.")
+        self.create_path_btn.clicked.connect(self._create_path)
+        root.addWidget(self.create_path_btn)
+
         # import
         imp = QGroupBox("Import")
         il = QVBoxLayout(imp)
@@ -191,3 +201,33 @@ class CADPanel(QWidget):
             QMessageBox.information(self, "Toolpath", "Generate a toolpath first.")
             return
         self.program_panel.add_toolpath(self.toolpath, speed=self.tp_speed.value())
+
+    # ---- path editor ------------------------------------------------------
+    def _create_path(self) -> None:
+        """Open the interactive Path Editor on the current CAD (if any)."""
+        kin = getattr(self.viewport, "kin", None)
+        if kin is None:
+            QMessageBox.warning(self, "Path Editor",
+                                "Kinematics not ready — no robot model loaded.")
+            return
+        if self.cad is None:
+            QMessageBox.information(
+                self, "Path Editor",
+                "No CAD is loaded. You can still draw a path on the work plane "
+                "in free space, then import a CAD later.")
+        from ui.panels.path_editor import PathEditorWindow
+        q0 = getattr(self.viewport, "_q", None)
+        self._path_editor = PathEditorWindow(
+            kin, self.cad, self.T_base_cad, self.program_panel,
+            q0=q0, parent=self.window())
+        self._path_editor.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        # Pause the main window's live twin-render loop while the editor's own
+        # 3D viewport is up, so the two OpenGL contexts don't contend; resume
+        # it when the editor closes.
+        timer = getattr(self.window(), "_render_timer", None)
+        if timer is not None:
+            timer.stop()
+            self._path_editor.destroyed.connect(
+                lambda *_: timer.start(33))
+        self._path_editor.show()
+        self._path_editor.raise_()

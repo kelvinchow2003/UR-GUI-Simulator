@@ -43,12 +43,16 @@ from robot.kinematics import Kinematics
 from robot.program import Program
 from robot.ur_models import get_model
 
+from robot.scene import SceneModel
+from robot.collision import CollisionWorld, link_radii
+
 from gui.viewport_3d import RobotViewport
 from ui.panels.connection_panel import ConnectionPanel
 from ui.panels.jog_panel import JogPanel
 from ui.panels.program_panel import ProgramPanel
 from ui.panels.editor_panel import EditorPanel
 from ui.panels.cad_panel import CADPanel
+from ui.panels.scene_panel import ScenePanel
 
 log = logging.getLogger("ur_gui.window")
 
@@ -60,6 +64,8 @@ class MainWindow(QMainWindow):
         self.model = get_model(bridge.config.model_name)
         self.kin = Kinematics(self.model)
         self.program = Program(name="Untitled")
+        self.scene = SceneModel(self)
+        self._coll_radii = None
 
         self.setWindowTitle("UR GUI Simulator")
         self.resize(1500, 950)
@@ -76,6 +82,8 @@ class MainWindow(QMainWindow):
         self.program_panel = ProgramPanel(bridge, self.program, self.jog_panel, self.kin)
         self.editor_panel = EditorPanel(bridge, self.program)
         self.cad_panel = CADPanel(self.program_panel, self.viewport)
+        self.scene_panel = ScenePanel(self.scene, self.viewport,
+                                      self.program_panel, self.kin, self)
 
         self._add_docks()
         self._menu()
@@ -85,6 +93,10 @@ class MainWindow(QMainWindow):
         # --- render / animation loop ---
         self._anim_path: np.ndarray | None = None
         self._anim_index = 0
+        self._anim_events: dict = {}
+        self._anim_stride = 1
+        self._carried_local = None
+        self._carried_half = None
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._render_tick)
         self._render_timer.start(33)      # ~30 fps
@@ -111,7 +123,9 @@ class MainWindow(QMainWindow):
 
         self.d_prog = self._dock("Program Builder", self.program_panel, R)
         self.d_cad = self._dock("CAD / Toolpath", self._scroll(self.cad_panel), R)
+        self.d_scene = self._dock("Scene / Palletizer", self._scroll(self.scene_panel), R)
         self.tabifyDockWidget(self.d_prog, self.d_cad)
+        self.tabifyDockWidget(self.d_cad, self.d_scene)
         self.d_prog.raise_()
 
         self.d_edit = self._dock("Code Editor", self.editor_panel, B, minw=400)
@@ -128,7 +142,8 @@ class MainWindow(QMainWindow):
     def _menu(self) -> None:
         mb = self.menuBar()
         view = mb.addMenu("&View")
-        for dock in (self.d_conn, self.d_jog, self.d_prog, self.d_cad, self.d_edit):
+        for dock in (self.d_conn, self.d_jog, self.d_prog, self.d_cad,
+                     self.d_scene, self.d_edit):
             view.addAction(dock.toggleViewAction())
         view.addSeparator()
         reset = QAction("Reset 3D view", self)
@@ -188,11 +203,26 @@ class MainWindow(QMainWindow):
         self.program_panel.status.connect(self._set_status)
         self.cad_panel.toolpath_ready.connect(
             lambda poses: self._set_status(f"Toolpath ready: {len(poses)} points."))
+        # (scene box rendering + selection highlight is owned by scene_panel)
+        self.program_panel.set_collision_checker(self._collision_check)
+
+    def _collision_check(self, q_path):
+        """Scene collision hook for offline simulation. Returns (idx, result)."""
+        if self._coll_radii is None:
+            self._coll_radii = link_radii(self.kin)
+        boxes = self.scene.all_collision_boxes()
+        if not boxes:
+            return -1, None
+        world = CollisionWorld(boxes, self._coll_radii)
+        return world.first_collision(self.kin, q_path, margin=0.005)
 
     def _on_model_changed(self, name: str) -> None:
         self.model = get_model(name)
         self.kin.set_model(self.model)
         self.viewport.set_kinematics(self.kin)
+        self._coll_radii = None
+        self.scene_panel._radii = None
+        self.scene_panel.apply_model_defaults()
         self._last_render_q = None
         self._set_status(f"Model set to {name}. "
                          + ("Real UR CAD loaded." if self.viewport._using_meshes
@@ -230,9 +260,43 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText(text)
 
     # ---- render / animation ----------------------------------------------
+    @staticmethod
+    def _playback_stride(n: int) -> int:
+        # keep total playback to roughly 600 frames (~20 s at 30 fps)
+        return max(1, n // 600)
+
     def _start_animation(self, q_path: np.ndarray) -> None:
         self._anim_path = np.asarray(q_path)
         self._anim_index = 0
+        self._anim_events = {}
+        self._anim_stride = self._playback_stride(len(self._anim_path))
+        self._carried_local = None
+        self._carried_half = None
+        self.viewport.set_carried_box(None)
+
+    def play_job(self, q_path: np.ndarray, events: dict) -> None:
+        """Animate a palletizing job: joint path + timeline events (reveal a
+        placed box, attach/detach the carried box)."""
+        self._anim_path = np.asarray(q_path)
+        self._anim_index = 0
+        self._anim_events = dict(events or {})
+        self._anim_stride = self._playback_stride(len(self._anim_path))
+        self._carried_local = None
+        self._carried_half = None
+        self.viewport.set_carried_box(None)
+        self.viewport.set_placed_visible(0)
+
+    def _apply_anim_event(self, i: int) -> None:
+        ev = self._anim_events.get(i)
+        if ev is None:
+            return
+        if ev[0] == "carry":
+            self._carried_local = np.asarray(ev[1], float)
+            self._carried_half = np.asarray(ev[2], float)
+        elif ev[0] == "drop_reveal":
+            self._carried_local = None
+            self.viewport.set_carried_box(None)
+            self.viewport.set_placed_visible(int(ev[1]))
 
     def _render_tick(self) -> None:
         # While the user is hand-guiding a joint in the 3D view, the drag
@@ -240,11 +304,24 @@ class MainWindow(QMainWindow):
         if getattr(self.viewport, "dragging", False):
             return
         if self._anim_path is not None:
-            q = self._anim_path[self._anim_index]
+            n = len(self._anim_path)
+            stride = self._anim_stride
+            i = self._anim_index
+            # apply every timeline event in the frames we're about to skip over
+            for j in range(i, min(i + stride, n)):
+                self._apply_anim_event(j)
+            k = min(i + stride - 1, n - 1)
+            q = self._anim_path[k]
             self.viewport.update_joints(q)
-            self._anim_index += 1
-            if self._anim_index >= len(self._anim_path):
+            if self._carried_local is not None:
+                T = self.kin.fk_frames(np.asarray(q, float))[-1] @ self._carried_local
+                self.viewport.set_carried_box(T, self._carried_half)
+            self._anim_index += stride
+            if self._anim_index >= n:
                 self._anim_path = None
+                self._anim_events = {}
+                self._carried_local = None
+                self.viewport.set_carried_box(None)
                 self._set_status("Simulation complete.")
             return
         # live: follow latest cached joint state — but only actually re-pose
