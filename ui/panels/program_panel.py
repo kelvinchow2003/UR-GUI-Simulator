@@ -23,7 +23,7 @@ from PySide6.QtCore import Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem, QPushButton,
     QGroupBox, QGridLayout, QInputDialog, QFileDialog, QMessageBox, QMenu,
-    QDoubleSpinBox, QLabel,
+    QDoubleSpinBox, QLabel, QDialog,
 )
 from PySide6.QtGui import QColor, QBrush
 
@@ -110,13 +110,29 @@ class ProgramPanel(QWidget):
         self.sim_steps.setValue(40); self.sim_steps.setPrefix("steps ")
         sim = QPushButton("Run Offline Simulation")
         sim.clicked.connect(self._simulate)
-        exe = QPushButton("Execute on Robot")
-        exe.setStyleSheet("background:#a3be8c;font-weight:bold")
-        exe.clicked.connect(self._execute)
+        self.exe_btn = QPushButton("Execute on Robot")
+        self.exe_btn.clicked.connect(self._execute)
         run.addWidget(self.sim_steps)
         run.addWidget(sim, 1)
-        run.addWidget(exe, 1)
+        run.addWidget(self.exe_btn, 1)
         root.addLayout(run)
+
+        # reflect live connection state on the Execute button
+        self.bridge.connected_changed.connect(self._on_connected)
+        self._on_connected(self.bridge.state.connected)
+
+    def _on_connected(self, connected: bool) -> None:
+        """Style the Execute button so it's obvious whether a run is real."""
+        if connected:
+            self.exe_btn.setText("▶ Execute on Robot")
+            self.exe_btn.setStyleSheet("background:#a3be8c;font-weight:bold")
+            self.exe_btn.setToolTip("Send the program to the connected robot.")
+        else:
+            self.exe_btn.setText("▶ Execute (offline — logged)")
+            self.exe_btn.setStyleSheet("background:#5a5f6a;color:#e8e8e8")
+            self.exe_btn.setToolTip(
+                "Not connected — the compiled URScript is logged, not run. "
+                "Connect a robot to execute for real.")
 
     # ---- add / teach ------------------------------------------------------
     def _teach(self, step_type: StepType) -> None:
@@ -224,35 +240,31 @@ class ProgramPanel(QWidget):
         step = self._selected_step()
         if not step:
             return
-        if step.type in (StepType.MOVEJ, StepType.MOVEL, StepType.MOVEP,
-                         StepType.PROCESS):
-            v, ok = QInputDialog.getDouble(self, "Edit speed", "Speed:",
-                                           step.speed, 0.001, 5.0, 3)
-            if ok:
-                step.speed = v
-            v, ok = QInputDialog.getDouble(self, "Edit accel", "Accel:",
-                                           step.accel, 0.01, 10.0, 3)
-            if ok:
-                step.accel = v
-            v, ok = QInputDialog.getDouble(self, "Blend radius (m)", "Blend:",
-                                           step.blend, 0.0, 0.5, 4)
-            if ok:
-                step.blend = v
-        elif step.type is StepType.DELAY:
-            v, ok = QInputDialog.getDouble(self, "Delay", "Seconds:",
-                                           step.duration, 0.0, 3600, 2)
-            if ok:
-                step.duration = v
-        elif step.type is StepType.COMMENT:
-            v, ok = QInputDialog.getText(self, "Comment", "Text:", text=step.text)
-            if ok:
-                step.text = v
-        self.refresh(select_uid=step.uid)
+        # Gripper-open/close have nothing editable but a name; everything else
+        # (including full joint/pose targets) goes through the unified dialog.
+        from ui.panels.step_editor import StepEditDialog
+        dlg = StepEditDialog(step, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            dlg.apply()
+            self.refresh(select_uid=step.uid)
+            self.program_changed.emit()
+
+    def _duplicate_selected(self) -> None:
+        idx = self._selected_index()
+        if idx is None:
+            return
+        import copy
+        clone = copy.deepcopy(self.program.steps[idx])
+        clone.uid = ProgramStep._next_uid()          # fresh identity
+        self.program.add(clone, index=idx + 1)
+        self.refresh(select_uid=clone.uid)
         self.program_changed.emit()
 
     def _context_menu(self, pos) -> None:
         menu = QMenu(self)
-        menu.addAction("Edit", self._edit_selected)
+        menu.addAction("Edit…", self._edit_selected)
+        menu.addAction("Duplicate", self._duplicate_selected)
+        menu.addSeparator()
         menu.addAction("Move up", lambda: self._reorder(-1))
         menu.addAction("Move down", lambda: self._reorder(+1))
         menu.addAction("Enable/Disable", self._toggle_enabled)
@@ -330,14 +342,17 @@ class ProgramPanel(QWidget):
         if not any(s.enabled for s in self.program.steps):
             self.status.emit("Program is empty — nothing to execute.")
             return
-        reply = QMessageBox.warning(
-            self, "Execute on robot",
-            "This will move the PHYSICAL robot.\n\n"
-            "Ensure the area is clear and you can reach the E-Stop.\n\nProceed?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        # A real move needs an explicit safety confirmation; an offline run
+        # only animates the twin + logs the script, so it proceeds directly.
+        if self.bridge.state.connected:
+            reply = QMessageBox.warning(
+                self, "Execute on robot",
+                "This will move the PHYSICAL robot.\n\n"
+                "Ensure the area is clear and you can reach the E-Stop.\n\nProceed?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
         # Always animate the digital twin so the operator sees what will run.
         try:
             self.simulate_requested.emit(self._build_joint_path())
@@ -351,9 +366,12 @@ class ProgramPanel(QWidget):
         from robot.program import URScriptGenerator
         script = URScriptGenerator().generate(self.program)
         self.bridge.run_script(script)
-        self.status.emit(
-            f"Program ({sum(s.enabled for s in self.program.steps)} steps) "
-            "sent to robot as one URScript unit.")
+        n = sum(s.enabled for s in self.program.steps)
+        if self.bridge.state.connected:
+            self.status.emit(f"Program ({n} steps) sent to robot as one URScript unit.")
+        else:
+            self.status.emit(f"Program ({n} steps) compiled & logged (offline — "
+                             "not connected). Simulating on the twin.")
 
     # ---- render -----------------------------------------------------------
     def refresh(self, select_uid=None) -> None:

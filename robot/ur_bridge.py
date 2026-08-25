@@ -540,9 +540,16 @@ class URWorker(QObject):
         self._model = get_model(name)
         self.log.emit("INFO", f"Active model: {name}")
 
-    @Slot(object)
+    @Slot(list)
     def set_tcp_pose(self, pose: list) -> None:
-        """Called by the bridge to inject FK-computed TCP pose while simulating."""
+        """Called by the bridge to inject FK-computed TCP pose while simulating.
+
+        Declared ``@Slot(list)`` (registered as ``QVariantList``) so the
+        queued cross-thread ``invokeMethod`` from :meth:`URBridge.set_tcp_pose`
+        actually resolves — a ``@Slot(object)`` here registers as ``PyObject``
+        and the QVariantList call silently fails, forcing a direct GUI-thread
+        write of ``_state`` (a thread-safety violation) plus console spam.
+        """
         self._state.tcp_pose = list(pose)
 
 

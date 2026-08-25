@@ -118,13 +118,15 @@ class EditorPanel(QWidget):
         self.export_btn = QPushButton("Export current tab…")
         self.export_btn.clicked.connect(self._export)
         self.exec_btn = QPushButton("Execute on Robot")
-        self.exec_btn.setStyleSheet("background:#a3be8c;font-weight:bold")
         self.exec_btn.clicked.connect(self._execute)
         bar.addWidget(gen)
         bar.addWidget(self.export_btn)
         bar.addStretch(1)
         bar.addWidget(self.exec_btn)
         root.addLayout(bar)
+
+        self.bridge.connected_changed.connect(self._on_connected)
+        self._on_connected(self.bridge.state.connected)
 
         # tabs
         self.tabs = QTabWidget()
@@ -137,6 +139,18 @@ class EditorPanel(QWidget):
         root.addWidget(self.tabs, 1)
 
         self.regenerate()
+
+    def _on_connected(self, connected: bool) -> None:
+        if connected:
+            self.exec_btn.setText("▶ Execute on Robot")
+            self.exec_btn.setStyleSheet("background:#a3be8c;font-weight:bold")
+            self.exec_btn.setToolTip("Push the URScript tab to the connected robot.")
+        else:
+            self.exec_btn.setText("▶ Execute (offline — logged)")
+            self.exec_btn.setStyleSheet("background:#5a5f6a;color:#e8e8e8")
+            self.exec_btn.setToolTip(
+                "Not connected — the URScript is logged, not run. "
+                "Connect a robot to execute for real.")
 
     # ---- generation -------------------------------------------------------
     def regenerate(self) -> None:
@@ -168,11 +182,14 @@ class EditorPanel(QWidget):
         script = self.ur_edit.toPlainText().strip()
         if not script:
             return
-        reply = QMessageBox.warning(
-            self, "Execute URScript",
-            "Send this URScript to the PHYSICAL robot now?\n"
-            "Confirm the workspace is clear.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            self.bridge.run_script(script)
+        # Only a live connection needs the safety gate; offline it's logged.
+        if self.bridge.state.connected:
+            reply = QMessageBox.warning(
+                self, "Execute URScript",
+                "Send this URScript to the PHYSICAL robot now?\n"
+                "Confirm the workspace is clear.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self.bridge.run_script(script)

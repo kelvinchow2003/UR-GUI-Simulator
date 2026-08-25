@@ -164,8 +164,12 @@ class JogPanel(QWidget):
     def _clamp(self, q: np.ndarray) -> np.ndarray:
         return np.clip(q, self.kin.q_min, self.kin.q_max)
 
+    def _joint_step_rad(self) -> float:
+        """The joint-jog increment in radians, honouring the units toggle."""
+        return np.radians(self.jstep.value()) if self._use_deg else self.jstep.value()
+
     def _jog_joint(self, joint: int, sign: int) -> None:
-        step = np.radians(self.jstep.value())
+        step = self._joint_step_rad()
         target = self._cmd_q.copy()
         target[joint] += sign * step
         self._cmd_q = self._clamp(target)
@@ -227,6 +231,21 @@ class JogPanel(QWidget):
 
     # ---- units ------------------------------------------------------------
     def _toggle_units(self, use_deg: bool) -> None:
+        # Convert the joint-step field between degrees and radians so the value
+        # the user set keeps its physical meaning across the toggle.
+        self.jstep.blockSignals(True)
+        current_rad = self._joint_step_rad()
+        if use_deg:
+            self.jstep.setSuffix(" °")
+            self.jstep.setRange(0.1, 45.0)
+            self.jstep.setDecimals(1)
+            self.jstep.setValue(np.degrees(current_rad))
+        else:
+            self.jstep.setSuffix(" rad")
+            self.jstep.setRange(0.001, 0.8)
+            self.jstep.setDecimals(3)
+            self.jstep.setValue(current_rad)
+        self.jstep.blockSignals(False)
         self._use_deg = use_deg
         self._refresh_joint_labels()
 
