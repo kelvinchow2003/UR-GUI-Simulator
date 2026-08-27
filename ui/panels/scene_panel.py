@@ -28,6 +28,8 @@ E-stop in reach.
 """
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -68,6 +70,13 @@ class ScenePanel(QWidget):
         self._preview_specs = None          # currently previewed placements
         self._sel_ref = None                # ('obstacle'|'pallet', index) or None
         self._scene_ctl = None
+        # undo/redo history (scene objects + robot base pose) and clipboard
+        self._undo: list = []
+        self._redo: list = []
+        self._clipboard = None              # ('obstacle'|'pallet', deep copy)
+        self._paste_n = 0                   # cascade successive pastes
+        self._pre_snap = None               # snapshot captured at a drag start
+        self._moved = False                 # did the current drag change anything
         self._build()
         self.scene.changed.connect(self._render_scene)
         self._render_scene()
@@ -79,10 +88,22 @@ class ScenePanel(QWidget):
 
         tip = QLabel("Tip: click an object in the 3D view to select it — drag to "
                      "move (Shift = up/down), Del to delete, right-click for "
-                     "duplicate / resize.")
+                     "copy / paste / resize. Ctrl+Z/Y undo/redo, Ctrl+C/V copy/paste.")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#5e81ac;font-size:10px")
         root.addWidget(tip)
+
+        # ---------- edit: undo / redo / copy / paste ----------
+        edrow = QHBoxLayout()
+        for label, fn, tipx in (
+                ("↶ Undo", self.undo, "Undo the last scene edit (Ctrl+Z)."),
+                ("↷ Redo", self.redo, "Redo (Ctrl+Y / Ctrl+Shift+Z)."),
+                ("Copy", self.copy_selected, "Copy the selected object (Ctrl+C)."),
+                ("Paste", self.paste_clipboard, "Paste a copy (Ctrl+V).")):
+            b = QPushButton(label); b.setToolTip(tipx)
+            b.clicked.connect(fn); edrow.addWidget(b)
+        edrow.addStretch(1)
+        root.addLayout(edrow)
 
         # ---------- origin-axis gizmos ----------
         axrow = QHBoxLayout()
@@ -350,28 +371,33 @@ class ScenePanel(QWidget):
     def _add_obstacle(self) -> None:
         size = np.array([self.ob_l.value(), self.ob_w.value(), self.ob_h.value()]) / 1000
         c = np.array([self.ob_x.value(), self.ob_y.value(), self.ob_z.value()]) / 1000
+        self._checkpoint()
         self.scene.add_obstacle(Box.from_size_center(size, c, name="obstacle"))
         self.report_lbl.setText("Added obstacle. The arm will avoid it in Simulate "
                                 "and Run Offline Simulation.")
 
     def _add_pedestal(self) -> None:
+        self._checkpoint()
         self.scene.add_pedestal(self.kin)
         self.report_lbl.setText("Added a pedestal under the robot base.")
 
     def _dup_obstacle(self) -> None:
         i = self.obs_list.currentRow()
         if i >= 0:
+            self._checkpoint()
             self.scene.duplicate_obstacle(i)
             self.report_lbl.setText("Duplicated obstacle.")
 
     def _del_obstacle(self) -> None:
         i = self.obs_list.currentRow()
         if i >= 0:
+            self._checkpoint()
             self.scene.remove_obstacle(i)
             self.report_lbl.setText("Deleted obstacle.")
 
     # ---- conveyor actions -------------------------------------------------
     def _add_conveyor(self) -> None:
+        self._checkpoint()
         conv = self.scene.add_conveyor(
             self.cv_l.value() / 1000, self.cv_w.value() / 1000,
             self.cv_h.value() / 1000, x=self.cv_x.value() / 1000,
@@ -420,6 +446,7 @@ class ScenePanel(QWidget):
             self.report_lbl.setText("No conveyor to delete.")
             return
         i = self.scene.obstacles.index(conv)
+        self._checkpoint()
         self.scene.remove_obstacle(i)
         self.report_lbl.setText(f"Deleted conveyor '{conv.name}'.")
 
@@ -459,6 +486,7 @@ class ScenePanel(QWidget):
         """Apply the role dropdown to the selected pallet immediately."""
         i = self.pallet_list.currentRow()
         if 0 <= i < len(self.scene.pallets):
+            self._checkpoint()
             self.scene.pallets[i].role = _ROLES[int(idx)]
             self.scene.changed.emit()
             self.report_lbl.setText(
@@ -531,6 +559,7 @@ class ScenePanel(QWidget):
     def _add_starter_pallet(self) -> None:
         """One-click: reach-fitted pallet added and ready to Simulate."""
         self.apply_model_defaults()
+        self._checkpoint()
         self.scene.add_pallet(self._spec_from_form())
         self.pallet_list.setCurrentRow(len(self.scene.pallets) - 1)
         name = self.scene.pallets[-1].name
@@ -539,6 +568,7 @@ class ScenePanel(QWidget):
             f"“Simulate palletization”.")
 
     def _add_pallet(self) -> None:
+        self._checkpoint()
         self.scene.add_pallet(self._spec_from_form())
         self.pallet_list.setCurrentRow(len(self.scene.pallets) - 1)
         self.report_lbl.setText(
@@ -551,6 +581,8 @@ class ScenePanel(QWidget):
             return
         new = self._spec_from_form()
         new.name = self.scene.pallets[i].name
+        new.role = self.scene.pallets[i].role       # keep the pallet's role
+        self._checkpoint()
         self.scene.pallets[i] = new
         self.scene.changed.emit()
         self.report_lbl.setText(f"Updated '{new.name}'. Preview or Simulate.")
@@ -561,6 +593,7 @@ class ScenePanel(QWidget):
             self.report_lbl.setText("Select a pallet in the list to copy.")
             return
         w = float(self.scene.pallets[i].size[1])
+        self._checkpoint()
         self.scene.duplicate_pallet(i, offset=(0.0, w + 0.1, 0.0))
         self.report_lbl.setText(
             f"Copied to '{self.scene.pallets[-1].name}' (beside the original). "
@@ -570,6 +603,7 @@ class ScenePanel(QWidget):
         i = self.pallet_list.currentRow()
         if i >= 0:
             name = self.scene.pallets[i].name
+            self._checkpoint()
             self.scene.remove_pallet(i)
             self.report_lbl.setText(f"Deleted '{name}'.")
 
@@ -578,6 +612,7 @@ class ScenePanel(QWidget):
         if i < 0:
             self.report_lbl.setText("Select a pallet in the list to move.")
             return
+        self._checkpoint()
         self.scene.move_pallet(i, x=self.pp_x.value() / 1000,
                                y=self.pp_y.value() / 1000,
                                z=self.pp_z.value() / 1000,
@@ -920,6 +955,7 @@ class ScenePanel(QWidget):
     def gizmo_commit(self, ref) -> None:
         """Finish a gizmo drag: refresh lists/collision (scene items) and redraw
         the gizmos at the final pose."""
+        self.commit_interaction()          # one undo step for the whole gizmo drag
         kind, _ = ref
         if kind == "robot":
             self._rebuild_axes()
@@ -930,6 +966,115 @@ class ScenePanel(QWidget):
         else:
             self.scene.changed.emit()          # refreshes lists + rebuilds axes
             self.report_lbl.setText(f"Moved {self._ref_name(ref)}.")
+
+    # ---- undo / redo / clipboard -----------------------------------------
+    def _snapshot(self) -> dict:
+        """A deep copy of everything the user can create/edit on screen."""
+        return dict(obstacles=copy.deepcopy(self.scene.obstacles),
+                    pallets=copy.deepcopy(self.scene.pallets),
+                    base=self.kin.base_pose())
+
+    def _restore(self, snap: dict) -> None:
+        self.scene.obstacles = copy.deepcopy(snap["obstacles"])
+        self.scene.pallets = copy.deepcopy(snap["pallets"])
+        self.kin.set_base_pose(snap["base"])
+        self._sel_ref = None
+        self.scene.changed.emit()                  # re-render lists + gizmos
+        self.viewport.update_joints(self.viewport._q)   # reflect base pose
+
+    def _checkpoint(self) -> None:
+        """Record the current state so the *next* mutation can be undone."""
+        self._undo.append(self._snapshot())
+        if len(self._undo) > 50:
+            self._undo.pop(0)
+        self._redo.clear()
+
+    def undo(self) -> None:
+        if not self._undo:
+            self.report_lbl.setText("Nothing to undo.")
+            return
+        self._redo.append(self._snapshot())
+        self._restore(self._undo.pop())
+        self.report_lbl.setText("Undo.")
+
+    def redo(self) -> None:
+        if not self._redo:
+            self.report_lbl.setText("Nothing to redo.")
+            return
+        self._undo.append(self._snapshot())
+        self._restore(self._redo.pop())
+        self.report_lbl.setText("Redo.")
+
+    # drags/gizmo moves: one undo step for the whole gesture, only if it moved
+    def begin_interaction(self) -> None:
+        self._pre_snap = self._snapshot()
+        self._moved = False
+
+    def mark_moved(self) -> None:
+        self._moved = True
+
+    def commit_interaction(self) -> None:
+        if self._moved and self._pre_snap is not None:
+            self._undo.append(self._pre_snap)
+            if len(self._undo) > 50:
+                self._undo.pop(0)
+            self._redo.clear()
+        self._pre_snap = None
+        self._moved = False
+
+    def _effective_ref(self):
+        """The object the copy/delete acts on: the 3D-selected one, else whatever
+        row is highlighted in the obstacle or pallet list."""
+        if self._ref_valid(self._sel_ref):
+            return self._sel_ref
+        i = self.obs_list.currentRow()
+        if 0 <= i < len(self.scene.obstacles):
+            return ("obstacle", i)
+        j = self.pallet_list.currentRow()
+        if 0 <= j < len(self.scene.pallets):
+            return ("pallet", j)
+        return None
+
+    def copy_selected(self) -> None:
+        """Copy the selected scene object (obstacle / conveyor / pallet)."""
+        ref = self._effective_ref()
+        if not self._ref_valid(ref):
+            self.report_lbl.setText("Select an object (click it in 3D or in a list), "
+                                    "then Copy (Ctrl+C).")
+            return
+        kind, i = ref
+        src = self.scene.obstacles[i] if kind == "obstacle" else self.scene.pallets[i]
+        self._clipboard = (kind, copy.deepcopy(src))
+        self._paste_n = 0
+        self.report_lbl.setText(f"Copied {getattr(src, 'name', 'object')}. "
+                                f"Paste with Ctrl+V.")
+
+    def paste_clipboard(self) -> None:
+        """Paste the clipboard object at a cascading offset from the original."""
+        if self._clipboard is None:
+            self.report_lbl.setText("Clipboard is empty — Copy (Ctrl+C) something first.")
+            return
+        kind, obj = self._clipboard
+        self._checkpoint()
+        self._paste_n += 1
+        off = np.array([0.12, 0.12, 0.0]) * self._paste_n
+        new = copy.deepcopy(obj)
+        new.T = new.T.copy()
+        new.T[:3, 3] = new.T[:3, 3] + off
+        if kind == "obstacle":
+            new.name = self.scene._unique(new.name, [o.name for o in self.scene.obstacles])
+            self.scene.obstacles.append(new)
+            self._sel_ref = ("obstacle", len(self.scene.obstacles) - 1)
+            self.scene.changed.emit()
+            self.obs_list.setCurrentRow(len(self.scene.obstacles) - 1)
+        else:
+            new.name = self.scene._unique(new.name, [p.name for p in self.scene.pallets])
+            self.scene.pallets.append(new)
+            self._sel_ref = ("pallet", len(self.scene.pallets) - 1)
+            self.scene.changed.emit()
+            self.pallet_list.setCurrentRow(len(self.scene.pallets) - 1)
+        self.report_lbl.setText(f"Pasted {new.name} — drag it or use Pallet pos to "
+                                f"place it.")
 
     # ---- direct 3D-scene editing (select / drag / delete / resize) --------
     def _install_scene_controller(self) -> None:
@@ -1007,6 +1152,7 @@ class ScenePanel(QWidget):
 
     def end_drag(self) -> None:
         """Commit a drag: one full refresh (lists + collision picking meta)."""
+        self.commit_interaction()          # one undo step for the whole drag
         p = self.item_position(self._sel_ref)
         self.scene.changed.emit()
         if self._ref_valid(self._sel_ref):
@@ -1015,12 +1161,13 @@ class ScenePanel(QWidget):
                 f"Y={p[1]*1000:.0f} Z={p[2]*1000:.0f} mm.")
 
     def delete_selected_scene(self) -> None:
-        ref = self._sel_ref
+        ref = self._effective_ref()
         if not self._ref_valid(ref):
             return
         name = self._ref_name(ref)
         kind, i = ref
         self._sel_ref = None
+        self._checkpoint()
         if kind == "obstacle":
             self.scene.remove_obstacle(i)
         else:
@@ -1028,10 +1175,11 @@ class ScenePanel(QWidget):
         self.report_lbl.setText(f"Deleted {name}.")
 
     def duplicate_selected_scene(self) -> None:
-        ref = self._sel_ref
+        ref = self._effective_ref()
         if not self._ref_valid(ref):
             return
         kind, i = ref
+        self._checkpoint()
         if kind == "obstacle":
             self.scene.duplicate_obstacle(i)
             self._sel_ref = ("obstacle", len(self.scene.obstacles) - 1)
@@ -1056,6 +1204,7 @@ class ScenePanel(QWidget):
             if not ok:
                 return
             vals.append(v / 1000.0)
+        self._checkpoint()
         if kind == "obstacle":
             self.scene.resize_obstacle(i, vals)
         else:
@@ -1067,6 +1216,8 @@ class ScenePanel(QWidget):
     def context_menu(self, ref) -> None:
         from PySide6.QtGui import QCursor
         menu = QMenu(self)
+        menu.addAction("Copy\tCtrl+C", self.copy_selected)
+        menu.addAction("Paste\tCtrl+V", self.paste_clipboard)
         menu.addAction("Duplicate", self.duplicate_selected_scene)
         menu.addAction("Resize…", self.resize_selected_scene)
         menu.addSeparator()
@@ -1178,6 +1329,7 @@ class _SceneEditController:
         a = T0[:3, axis].copy()
         a = a / (np.linalg.norm(a) + 1e-12)
         self._giz = dict(ref=ref, axis=axis, kind=kind, T0=T0.copy(), o0=o0, a=a)
+        self._p.begin_interaction()            # snapshot for a single undo step
         p0, p1 = self._vp.world_ray(x, y)
         if kind == "move":
             s0 = self._axis_param(p0, p1, o0, a)
@@ -1191,6 +1343,7 @@ class _SceneEditController:
 
     def _gizmo_move(self, x, y) -> None:
         g = self._giz
+        self._p.mark_moved()
         p0, p1 = self._vp.world_ray(x, y)
         if g["kind"] == "move":
             s = self._axis_param(p0, p1, g["o0"], g["a"])
@@ -1227,6 +1380,7 @@ class _SceneEditController:
                 self._p.select_ref(None)               # click empty = deselect
             return                                     # let the camera orbit
         self._p.select_ref(ref)
+        self._p.begin_interaction()            # snapshot for a single undo step
         pos = self._p.item_position(ref)
         self._z0 = float(pos[2])
         self._mode = "z" if self._iren.GetShiftKey() else "xy"
@@ -1250,6 +1404,7 @@ class _SceneEditController:
             return
         if not self._moving:
             return
+        self._p.mark_moved()
         x, y = self._iren.GetEventPosition()
         p0, p1 = self._vp.world_ray(x, y)
         if self._mode == "xy":
@@ -1291,9 +1446,14 @@ class _SceneEditController:
             self._thaw()
 
     def _key(self, obj, evt):
+        # Ctrl+Z/Y/C/V are handled by the main window's Edit-menu QActions
+        # (reliable while the window is active — VTK's own Ctrl+key delivery is
+        # not). Bare Delete is kept here as a convenience; if the menu's Delete
+        # also fires, the second call is a harmless no-op (selection cleared).
         try:
             k = self._iren.GetKeySym()
+            ctrl = bool(self._iren.GetControlKey())
         except Exception:                              # noqa: BLE001
             return
-        if k in ("Delete", "BackSpace") and self._p._sel_ref is not None:
+        if not ctrl and k in ("Delete", "BackSpace") and self._p._sel_ref is not None:
             self._p.delete_selected_scene()

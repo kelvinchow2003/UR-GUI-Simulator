@@ -142,6 +142,34 @@ class MainWindow(QMainWindow):
     # ---- menu -------------------------------------------------------------
     def _menu(self) -> None:
         mb = self.menuBar()
+
+        # Edit: undo/redo/copy/paste for scene objects. Qt shortcuts fire while
+        # the app window is active (including when the 3D view has focus), which
+        # VTK's own key handling does not do reliably for Ctrl+key combos.
+        edit = mb.addMenu("&Edit")
+        sp = self.scene_panel
+        for text, seq, fn in (
+                ("Undo", QKeySequence.StandardKey.Undo, sp.undo),
+                ("Redo", QKeySequence.StandardKey.Redo, sp.redo),
+                (None, None, None),
+                ("Copy object", QKeySequence.StandardKey.Copy, sp.copy_selected),
+                ("Paste object", QKeySequence.StandardKey.Paste, sp.paste_clipboard),
+                ("Duplicate", QKeySequence("Ctrl+D"), sp.duplicate_selected_scene),
+                ("Delete", QKeySequence.StandardKey.Delete, sp.delete_selected_scene)):
+            if text is None:
+                edit.addSeparator()
+                continue
+            act = QAction(text, self)
+            if text == "Redo":           # accept both Ctrl+Y and Ctrl+Shift+Z
+                act.setShortcuts([QKeySequence.StandardKey.Redo,
+                                  QKeySequence("Ctrl+Shift+Z")])
+            else:
+                act.setShortcut(seq)
+            act.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+            act.triggered.connect(fn)
+            edit.addAction(act)
+            self.addAction(act)          # ensure the shortcut is app-window active
+
         view = mb.addMenu("&View")
         for dock in (self.d_conn, self.d_jog, self.d_prog, self.d_cad,
                      self.d_scene, self.d_edit):
