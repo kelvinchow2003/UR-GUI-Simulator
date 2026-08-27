@@ -51,20 +51,70 @@ class SceneModel(QObject):
             self.obstacles.append(b)
             self.changed.emit()
 
-    def add_pedestal(self, kin) -> None:
-        """A rectangular base directly under the robot (mounts it higher)."""
+    def add_pedestal(self, kin, height: float = 0.3) -> None:
+        """A rectangular base directly under the robot that **mounts it higher**.
+
+        The pedestal sits *on the floor* (bottom face at z=0) and stacks on top
+        of any pedestal already there. The robot base is then raised by the total
+        pedestal height (see :meth:`pedestal_height`, applied by the main window)
+        so it stands on the pedestal rather than being buried in the floor.
+        """
         reach = 0.4
         try:
             reach = max(0.3, float(np.sum(np.abs(kin.a))) * 0.5)
         except Exception:                              # noqa: BLE001
             pass
-        size = np.array([reach, reach, 0.3])
-        # top face at z=0 (robot base sits on it) → centre below the base
-        box = Box.from_size_center(size, [0.0, 0.0, -size[2] / 2.0],
+        z0 = self.pedestal_height()                    # top of any existing stack
+        size = np.array([reach, reach, float(height)])
+        # bottom face on the floor (or on the pedestal below) → centre half-up
+        box = Box.from_size_center(size, [0.0, 0.0, z0 + size[2] / 2.0],
                                    name=self._unique("pedestal",
                                                      [o.name for o in self.obstacles]),
                                    kind="pedestal")
         self.add_obstacle(box)
+
+    def pedestal_height(self) -> float:
+        """Total height of the pedestal stack under the robot base (0 if none).
+
+        Pedestals sit on the floor, so the tallest top face is the height the
+        robot base must be lifted to stand on them.
+        """
+        tops = [float(b.T[2, 3] + b.half[2]) for b in self.obstacles
+                if b.kind == "pedestal" and b.enabled]
+        return max(tops) if tops else 0.0
+
+    # ---- conveyors --------------------------------------------------------
+    def add_conveyor(self, length: float, width: float, height: float,
+                     x: float = 0.4, y: float = -0.4, yaw_deg: float = 0.0) -> Box:
+        """A floor-standing conveyor: a solid box (``length``×``width``×``height``
+        metres) sitting on the floor with its top face at ``height``.
+
+        It is stored as a normal obstacle (``kind="conveyor"``) so it is a real
+        collision volume for the arm and can be selected/dragged/resized like any
+        box. Its **top surface** doubles as the box-spawn / pick surface — call
+        :meth:`conveyor_pick_point` to get where the robot lifts a box from it.
+        """
+        a = np.radians(yaw_deg)
+        R = np.array([[np.cos(a), -np.sin(a), 0.0],
+                      [np.sin(a), np.cos(a), 0.0],
+                      [0.0, 0.0, 1.0]])
+        size = np.array([float(length), float(width), float(height)])
+        centre = np.array([float(x), float(y), float(height) / 2.0])   # on floor
+        box = Box.from_size_center(size, centre,
+                                   name=self._unique("conveyor",
+                                                     [o.name for o in self.obstacles]),
+                                   kind="conveyor", R=R)
+        self.add_obstacle(box)
+        return box
+
+    @staticmethod
+    def conveyor_pick_point(conv: Box, box_height: float = 0.0) -> np.ndarray:
+        """World point where a box on the conveyor top is gripped: the top-face
+        centre, raised by ``box_height`` so the tool meets the *top* of a box
+        resting on the belt (grip = box top-face centre, matching the pallet)."""
+        top_centre = conv.T[:3, 3] + conv.T[:3, :3] @ np.array(
+            [0.0, 0.0, float(conv.half[2])])
+        return top_centre + np.array([0.0, 0.0, float(box_height)])
 
     # ---- pallets ----------------------------------------------------------
     def add_pallet(self, spec: PalletSpec) -> None:
@@ -151,6 +201,25 @@ class SceneModel(QObject):
         """Everything solid in the scene (obstacles + all slabs + all boxes)."""
         return self.static_boxes(exclude_pallet=-1)
 
+    def static_boxes_for_sequence(self, target: int, filled) -> List[Box]:
+        """The fixed world seen while filling pallet ``target`` in a sequential
+        multi-pallet run: every user obstacle, every *other* pallet's slab, and
+        the fully-stacked boxes of the pallets already filled (``filled`` = set
+        of pallet indices completed before this one).
+
+        Unlike :meth:`static_boxes`, the *future* pallets contribute only their
+        (empty) slabs, not phantom boxes — so when the robot fills pallet 2 it
+        must avoid the real boxes already on pallet 1, and errors if it can't."""
+        filled = set(filled or ())
+        boxes: List[Box] = [b for b in self.obstacles if b.enabled]
+        for j, spec in enumerate(self.pallets):
+            if j != target:
+                boxes.append(spec.pallet_box())        # every other slab is solid
+            if j in filled:
+                for k, pl in enumerate(generate_placements(spec)):
+                    boxes.append(pl.to_box(f"{spec.name}:box{k}"))
+        return boxes
+
     # ---- render specs -----------------------------------------------------
     def render_specs(self) -> List[dict]:
         """Static render list for the viewport (obstacles + pallet slabs).
@@ -159,10 +228,12 @@ class SceneModel(QObject):
         viewport can map a picked actor back to the scene item the user clicked.
         """
         specs = []
+        _obstacle_colors = {"pedestal": "#4c566a", "conveyor": "#434c5e"}
         for i, b in enumerate(self.obstacles):
-            specs.append(dict(T=b.T, half=b.half, name=b.name,
-                              color="#bf616a" if b.kind != "pedestal" else "#4c566a",
-                              opacity=0.35, ref=("obstacle", i)))
+            specs.append(dict(T=b.T, half=b.half, name=b.name, kind=b.kind,
+                              color=_obstacle_colors.get(b.kind, "#bf616a"),
+                              opacity=0.9 if b.kind == "conveyor" else 0.35,
+                              ref=("obstacle", i)))
         for i, spec in enumerate(self.pallets):
             slab = spec.pallet_box()
             specs.append(dict(T=slab.T, half=slab.half, name=slab.name,

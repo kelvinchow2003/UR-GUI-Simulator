@@ -206,6 +206,17 @@ class MainWindow(QMainWindow):
             lambda poses: self._set_status(f"Toolpath ready: {len(poses)} points."))
         # (scene box rendering + selection highlight is owned by scene_panel)
         self.program_panel.set_collision_checker(self._collision_check)
+        # A pedestal under the robot mounts it higher: keep the base height in
+        # sync with the pedestal stack whenever the scene is edited.
+        self.scene.changed.connect(self._sync_base_height)
+
+    def _sync_base_height(self) -> None:
+        """Lift the robot base to the top of the pedestal stack (0 if none)."""
+        h = self.scene.pedestal_height()
+        if abs(h - getattr(self.kin, "base_height", 0.0)) < 1e-9:
+            return                                      # unchanged — no re-render
+        self.kin.set_base_height(h)
+        self.viewport.update_joints(self.viewport._q)   # re-pose the twin, lifted
 
     def _collision_check(self, q_path):
         """Scene collision hook for offline simulation. Returns (idx, result)."""
@@ -220,10 +231,12 @@ class MainWindow(QMainWindow):
     def _on_model_changed(self, name: str) -> None:
         self.model = get_model(name)
         self.kin.set_model(self.model)
+        self.kin.set_base_height(self.scene.pedestal_height())  # re-apply mount
         self.viewport.set_kinematics(self.kin)
         self._coll_radii = None
         self.scene_panel._radii = None
         self.scene_panel.apply_model_defaults()
+        self.scene_panel._rebuild_axes()      # robot base reset → redraw gizmos
         self._last_render_q = None
         self._set_status(f"Model set to {name}. "
                          + ("Real UR CAD loaded." if self.viewport._using_meshes
@@ -288,9 +301,12 @@ class MainWindow(QMainWindow):
         self._carried_half = None
         self.viewport.set_carried_box(None)
 
-    def play_job(self, q_path: np.ndarray, events: dict) -> None:
-        """Animate a palletizing job: joint path + timeline events (reveal a
-        placed box, attach/detach the carried box)."""
+    def play_job(self, q_path: np.ndarray, events: dict,
+                 initial_visible=None) -> None:
+        """Animate a palletizing/transfer job: joint path + timeline events
+        (reveal or hide a box, attach/detach the carried box). ``initial_visible``
+        seeds which placed boxes start shown (a depalletize source pallet); None
+        starts with everything hidden (a plain palletize)."""
         self._anim_path = np.asarray(q_path)
         self._anim_index = 0
         self._anim_events = dict(events or {})
@@ -298,7 +314,10 @@ class MainWindow(QMainWindow):
         self._carried_local = None
         self._carried_half = None
         self.viewport.set_carried_box(None)
-        self.viewport.set_placed_visible(0)
+        if initial_visible is None:
+            self.viewport.set_placed_visible(0)
+        else:
+            self.viewport.set_boxes_visible(initial_visible)
 
     def _apply_anim_event(self, i: int) -> None:
         ev = self._anim_events.get(i)
@@ -311,6 +330,12 @@ class MainWindow(QMainWindow):
             self._carried_local = None
             self.viewport.set_carried_box(None)
             self.viewport.set_placed_visible(int(ev[1]))
+        elif ev[0] == "box_show":               # place a depalletized box
+            self._carried_local = None
+            self.viewport.set_carried_box(None)
+            self.viewport.set_box_visible(int(ev[1]), True)
+        elif ev[0] == "box_hide":               # source box just picked up
+            self.viewport.set_box_visible(int(ev[1]), False)
 
     def _render_tick(self) -> None:
         # While the user is hand-guiding a joint in the 3D view, the drag

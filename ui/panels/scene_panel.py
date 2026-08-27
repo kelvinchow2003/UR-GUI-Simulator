@@ -38,8 +38,10 @@ from PySide6.QtWidgets import (
 
 from robot.collision import Box, CollisionWorld, link_radii
 from robot.palletizer import (
-    PalletSpec, JobOptions, PalletJob, generate_placements,
+    PalletSpec, JobOptions, PalletJob, TransferJob, generate_placements,
 )
+
+_ROLES = ["stack", "source", "destination"]     # role_box index → PalletSpec.role
 
 
 def _spin(lo, hi, val, dec=0, step=10.0, suffix="") -> QDoubleSpinBox:
@@ -82,6 +84,21 @@ class ScenePanel(QWidget):
         tip.setStyleSheet("color:#5e81ac;font-size:10px")
         root.addWidget(tip)
 
+        # ---------- origin-axis gizmos ----------
+        axrow = QHBoxLayout()
+        axrow.addWidget(QLabel("Origin axes:"))
+        self.ax_robot = QCheckBox("Robot")
+        self.ax_pallet = QCheckBox("Pallet")
+        self.ax_conveyor = QCheckBox("Conveyor")
+        for c in (self.ax_robot, self.ax_pallet, self.ax_conveyor):
+            c.setToolTip("Show a draggable 3-axis gizmo at each origin. Drag an "
+                         "arrow to move along that axis; drag a ring to rotate "
+                         "about it. Red=X, Green=Y, Blue=Z.")
+            c.toggled.connect(self._rebuild_axes)
+            axrow.addWidget(c)
+        axrow.addStretch(1)
+        root.addLayout(axrow)
+
         # ---------- obstacles ----------
         ob = QGroupBox("Obstacles  (collision volumes)")
         og = QGridLayout(ob)
@@ -106,6 +123,35 @@ class ScenePanel(QWidget):
             b = QPushButton(label); b.clicked.connect(fn); row.addWidget(b)
         og.addLayout(row, 3, 0, 1, 4)
         root.addWidget(ob)
+
+        # ---------- conveyors ----------
+        cv = QGroupBox("Conveyors  (box source + obstacle)")
+        cg = QGridLayout(cv)
+        info = QLabel("A conveyor is a solid the arm avoids; its top surface is "
+                      "where boxes arrive to be picked. ‘Set as pick source’ points "
+                      "the palletizer’s pick at the belt top.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#5e81ac;font-size:10px")
+        cg.addWidget(info, 0, 0, 1, 4)
+        cg.addWidget(QLabel("Length×Width×Height (mm)"), 1, 0)
+        self.cv_l = _spin(50, 8000, 800); self.cv_w = _spin(50, 5000, 350)
+        self.cv_h = _spin(10, 3000, 400)
+        self.cv_h.setToolTip("Belt-top height above the floor. The conveyor stands "
+                             "on the floor; boxes are picked from its top.")
+        cg.addWidget(self.cv_l, 1, 1); cg.addWidget(self.cv_w, 1, 2)
+        cg.addWidget(self.cv_h, 1, 3)
+        cg.addWidget(QLabel("Pos X/Y (mm) + yaw°"), 2, 0)
+        self.cv_x = _spin(-3000, 3000, 300); self.cv_y = _spin(-3000, 3000, -450)
+        self.cv_yaw = _spin(-180, 180, 0, dec=1, step=5)
+        cg.addWidget(self.cv_x, 2, 1); cg.addWidget(self.cv_y, 2, 2)
+        cg.addWidget(self.cv_yaw, 2, 3)
+        crow = QHBoxLayout()
+        for label, fn in (("Add conveyor", self._add_conveyor),
+                          ("Set as pick source", self._set_pick_from_conveyor),
+                          ("Delete", self._del_conveyor)):
+            b = QPushButton(label); b.clicked.connect(fn); crow.addWidget(b)
+        cg.addLayout(crow, 3, 0, 1, 4)
+        root.addWidget(cv)
 
         # ---------- pallets ----------
         pl = QGroupBox("Pallets")
@@ -191,9 +237,22 @@ class ScenePanel(QWidget):
         move_btn.clicked.connect(self._apply_move)
         pg.addWidget(move_btn, 9, 2, 1, 2)
 
+        pg.addWidget(QLabel("Role"), 10, 0)
+        self.role_box = QComboBox()
+        self.role_box.addItems(["Stack (palletize)", "Source (depalletize)",
+                                "Destination"])
+        self.role_box.setToolTip(
+            "Stack: fill this pallet from the pick point / conveyor.\n"
+            "Source: it starts full — the robot lifts boxes OFF it.\n"
+            "Destination: the robot places the source's boxes ONTO it.\n"
+            "Mark one Source + one Destination, then Simulate to depalletize "
+            "from one pallet to the other.")
+        self.role_box.currentIndexChanged.connect(self._role_changed)
+        pg.addWidget(self.role_box, 10, 1, 1, 3)
+
         self.fit_lbl = QLabel("—")
         self.fit_lbl.setStyleSheet("color:#4c566a;font-size:10px")
-        pg.addWidget(self.fit_lbl, 10, 0, 1, 4)
+        pg.addWidget(self.fit_lbl, 11, 0, 1, 4)
         for s in (self.pl_l, self.pl_w, self.bx_l, self.bx_w, self.box_gap):
             s.valueChanged.connect(self._update_fit)
         self.layers.valueChanged.connect(self._update_fit)
@@ -204,7 +263,7 @@ class ScenePanel(QWidget):
         starter.setToolTip("One click: adds a ready-to-run pallet sized and placed "
                            "to fit THIS robot's reach, so Simulate works immediately.")
         starter.clicked.connect(self._add_starter_pallet)
-        pg.addWidget(starter, 11, 0, 1, 4)
+        pg.addWidget(starter, 12, 0, 1, 4)
 
         prow = QHBoxLayout()
         for label, fn in (("Add pallet", self._add_pallet),
@@ -212,7 +271,7 @@ class ScenePanel(QWidget):
                           ("Copy/Paste", self._copy_pallet),
                           ("Delete", self._del_pallet)):
             b = QPushButton(label); b.clicked.connect(fn); prow.addWidget(b)
-        pg.addLayout(prow, 12, 0, 1, 4)
+        pg.addLayout(prow, 13, 0, 1, 4)
         root.addWidget(pl)
 
         # ---------- palletize / simulate ----------
@@ -311,6 +370,59 @@ class ScenePanel(QWidget):
             self.scene.remove_obstacle(i)
             self.report_lbl.setText("Deleted obstacle.")
 
+    # ---- conveyor actions -------------------------------------------------
+    def _add_conveyor(self) -> None:
+        conv = self.scene.add_conveyor(
+            self.cv_l.value() / 1000, self.cv_w.value() / 1000,
+            self.cv_h.value() / 1000, x=self.cv_x.value() / 1000,
+            y=self.cv_y.value() / 1000, yaw_deg=self.cv_yaw.value())
+        # select it in the shared obstacle list and make it the pick source, so
+        # one click gives a working box source the robot picks from.
+        self.obs_list.setCurrentRow(len(self.scene.obstacles) - 1)
+        self._set_pick_from_conveyor(conv)
+        self.report_lbl.setText(
+            f"Added conveyor '{conv.name}' — it's a collision obstacle and now the "
+            f"pick source (boxes are picked from its top surface).")
+
+    def _selected_conveyor(self):
+        """The conveyor to act on: a selected/highlighted one if it is a conveyor,
+        otherwise the most recently added conveyor (None if there are none)."""
+        ref = self._sel_ref
+        if ref and ref[0] == "obstacle" and 0 <= ref[1] < len(self.scene.obstacles):
+            b = self.scene.obstacles[ref[1]]
+            if b.kind == "conveyor":
+                return b
+        i = self.obs_list.currentRow()
+        if 0 <= i < len(self.scene.obstacles) and self.scene.obstacles[i].kind == "conveyor":
+            return self.scene.obstacles[i]
+        convs = [b for b in self.scene.obstacles if b.kind == "conveyor"]
+        return convs[-1] if convs else None
+
+    def _set_pick_from_conveyor(self, conv=None) -> None:
+        if conv is None or conv is False:              # button passes bool 'checked'
+            conv = self._selected_conveyor()
+        if conv is None:
+            self.report_lbl.setText("Add or select a conveyor first, then set it as "
+                                    "the pick source.")
+            return
+        bh = self.bx_h.value() / 1000.0                # grip the top of a box on it
+        p = self.scene.conveyor_pick_point(conv, bh)
+        self.pick_x.setValue(p[0] * 1000)
+        self.pick_y.setValue(p[1] * 1000)
+        self.pick_z.setValue(p[2] * 1000)
+        self.report_lbl.setText(
+            f"Pick source = '{conv.name}' top surface (X={p[0]*1000:.0f}, "
+            f"Y={p[1]*1000:.0f}, Z={p[2]*1000:.0f} mm). Simulate to pick from it.")
+
+    def _del_conveyor(self) -> None:
+        conv = self._selected_conveyor()
+        if conv is None:
+            self.report_lbl.setText("No conveyor to delete.")
+            return
+        i = self.scene.obstacles.index(conv)
+        self.scene.remove_obstacle(i)
+        self.report_lbl.setText(f"Deleted conveyor '{conv.name}'.")
+
     # ---- pallet form ------------------------------------------------------
     def _grip_top_toggled(self, on: bool) -> None:
         for s in (self.gp_x, self.gp_y, self.gp_z):
@@ -340,7 +452,17 @@ class ScenePanel(QWidget):
                           layers=self.layers.value(),
                           box_gap=self.box_gap.value() / 1000,
                           layer_gap=self.layer_gap.value() / 1000,
-                          grip_point=grip, pattern=self.pattern_box.currentText())
+                          grip_point=grip, pattern=self.pattern_box.currentText(),
+                          role=_ROLES[self.role_box.currentIndex()])
+
+    def _role_changed(self, idx: int) -> None:
+        """Apply the role dropdown to the selected pallet immediately."""
+        i = self.pallet_list.currentRow()
+        if 0 <= i < len(self.scene.pallets):
+            self.scene.pallets[i].role = _ROLES[int(idx)]
+            self.scene.changed.emit()
+            self.report_lbl.setText(
+                f"'{self.scene.pallets[i].name}' role → {_ROLES[int(idx)]}.")
 
     def _load_pallet_to_form(self, i: int) -> None:
         if not (0 <= i < len(self.scene.pallets)):
@@ -356,6 +478,10 @@ class ScenePanel(QWidget):
         if j >= 0:
             self.pattern_box.setCurrentIndex(j)
         self.layers.setValue(s.layers)
+        role = getattr(s, "role", "stack")
+        self.role_box.blockSignals(True)               # loading, not user-editing
+        self.role_box.setCurrentIndex(_ROLES.index(role) if role in _ROLES else 0)
+        self.role_box.blockSignals(False)
         self.box_gap.setValue(s.box_gap * 1000); self.layer_gap.setValue(s.layer_gap * 1000)
         self.pp_x.setValue(s.T[0, 3] * 1000); self.pp_y.setValue(s.T[1, 3] * 1000)
         self.pp_z.setValue(s.T[2, 3] * 1000)
@@ -502,31 +628,157 @@ class ScenePanel(QWidget):
         return self._radii
 
     def _preview(self) -> None:
-        i, spec = self._current_spec()
-        if spec is None:
+        if not self.scene.pallets:
             self.report_lbl.setText("No pallet yet — click ★ Add starter pallet.")
             return
-        placements = generate_placements(spec)
-        specs = [dict(T=p.T, half=p.half) for p in placements]
-        self.viewport.build_placed_boxes(specs, color=spec.color)
+        # preview every pallet's stack (each in its own colour)
+        specs = []
+        for p in self.scene.pallets:
+            specs += [dict(T=pl.T, half=pl.half, color=p.color)
+                      for pl in generate_placements(p)]
+        self.viewport.build_placed_boxes(specs)
         self.viewport.set_placed_visible(len(specs))
         if specs:
-            self.report_lbl.setText(f"Preview: {len(specs)} boxes on '{spec.name}'. "
-                                    f"Click Simulate to test the robot.")
+            self.report_lbl.setText(
+                f"Preview: {len(specs)} boxes across {len(self.scene.pallets)} "
+                f"pallet(s). Click Simulate to run the robot.")
         else:
             self.report_lbl.setText("No boxes fit — the box is larger than the "
                                     "pallet. Increase pallet or reduce box size.")
 
-    def _build_job(self):
-        i, spec = self._current_spec()
-        if spec is None:
-            self.report_lbl.setText("No pallet yet — click ★ Add starter pallet.")
-            return None, None
-        q0 = getattr(self.viewport, "_q", None)
-        static = self.scene.static_boxes(exclude_pallet=i)
-        job = PalletJob(self.kin, static, spec, self._job_opts(),
-                        q_start=q0, radii=self._radii_cached())
-        return job, spec
+    def _plan_sequence(self) -> dict:
+        """Plan **every** pallet in list order as one continuous job. Each pallet
+        is filled while the boxes already stacked on earlier pallets stand as
+        obstacles, so the robot avoids them and errors out if it can't. The per-
+        pallet sims/events/steps are chained into one timeline (box reveals get a
+        global index; the animation stops at the first pallet that fails)."""
+        opts = self._job_opts()
+        q_prev = getattr(self.viewport, "_q", None)
+        q_prev = (np.asarray(q_prev, float) if q_prev is not None
+                  else np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]))
+        g_sim = [q_prev.copy()]
+        g_events: dict = {}
+        g_steps = []
+        placed_specs = []
+        placed_offset = 0
+        ok = True
+        fail_cut = -1
+        parts = []
+        for k, spec in enumerate(self.scene.pallets):
+            static = self.scene.static_boxes_for_sequence(k, set(range(k)))
+            job = PalletJob(self.kin, static, spec, opts,
+                            q_start=q_prev, radii=self._radii_cached())
+            steps, sim, events, report = job.plan()
+            sim = np.asarray(sim, float)
+            pls = generate_placements(spec)
+            placed_specs += [dict(T=p.T, half=p.half, color=spec.color) for p in pls]
+            base = len(g_sim)                 # g_sim[-1] == this job's sim[0]
+            for j, ev in events.items():
+                if ev[0] == "drop_reveal":
+                    ev = ("drop_reveal", placed_offset + ev[1])
+                g_events[(base - 1) + j] = ev
+            g_steps += steps
+            g_sim.extend(sim[1:].tolist())
+            placed_offset += len(pls)
+            q_prev = np.asarray(g_sim[-1], float)
+            parts.append(f"{spec.name}: {report.message}")
+            if not report.ok:
+                ok = False
+                fail_cut = ((base - 1) + report.first_fail_sample + 1
+                            if report.first_fail_sample >= 0 else len(g_sim))
+                break
+        return dict(steps=g_steps, sim=np.asarray(g_sim, float), events=g_events,
+                    placed=placed_specs, ok=ok, fail_cut=fail_cut,
+                    initial_visible=None,
+                    message="   |   ".join(parts))
+
+    def _has_transfer(self) -> bool:
+        roles = [getattr(p, "role", "stack") for p in self.scene.pallets]
+        return "source" in roles and "destination" in roles
+
+    def _plan_transfer_scene(self) -> dict:
+        """Plan a run that includes depalletize→palletize transfers. Source and
+        destination pallets are paired in list order; any 'stack' pallets are
+        palletized normally. Boxes on source pallets start visible and disappear
+        as they're picked; destination/stack boxes appear as they're placed.
+        Boxes present on other pallets stay as obstacles the robot avoids."""
+        opts = self._job_opts()
+        pallets = self.scene.pallets
+        roles = [getattr(p, "role", "stack") for p in pallets]
+        bases, base = [], 0
+        for p in pallets:
+            bases.append(base)
+            base += p.total_boxes()
+        placed_specs = []
+        for p in pallets:
+            placed_specs += [dict(T=pl.T, half=pl.half, color=p.color)
+                             for pl in generate_placements(p)]
+        initial_visible = [gi for i, p in enumerate(pallets) if roles[i] == "source"
+                           for gi in range(bases[i], bases[i] + p.total_boxes())]
+        srcs = [i for i, r in enumerate(roles) if r == "source"]
+        dsts = [i for i, r in enumerate(roles) if r == "destination"]
+        stacks = [i for i, r in enumerate(roles) if r == "stack"]
+        present = set(srcs)                    # pallets currently holding boxes
+
+        q_prev = getattr(self.viewport, "_q", None)
+        q_prev = (np.asarray(q_prev, float) if q_prev is not None
+                  else np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]))
+        g_sim = [q_prev.copy()]
+        g_events: dict = {}
+        g_steps = []
+        parts, ok, fail_cut = [], True, -1
+
+        def static_for(owned: set):
+            boxes = [b for b in self.scene.obstacles if b.enabled]
+            for j, p in enumerate(pallets):
+                if j in owned:
+                    continue
+                boxes.append(p.pallet_box())
+                if j in present:
+                    boxes += [pl.to_box(f"{p.name}:box{k}")
+                              for k, pl in enumerate(generate_placements(p))]
+            return boxes
+
+        def commit(steps, sim, events):
+            sim = np.asarray(sim, float)
+            base_i = len(g_sim)                # g_sim[-1] == this job's sim[0]
+            for j, ev in events.items():
+                g_events[(base_i - 1) + j] = ev
+            g_steps.extend(steps)
+            g_sim.extend(sim[1:].tolist())
+            return base_i
+
+        jobs = [("xfer", s, d) for s, d in zip(srcs, dsts)] + \
+               [("stack", p_i, None) for p_i in stacks]
+        for kind, a, b in jobs:
+            if kind == "xfer":
+                job = TransferJob(self.kin, static_for({a, b}), pallets[a], pallets[b],
+                                  opts, q_start=q_prev, radii=self._radii_cached(),
+                                  base_src=bases[a], base_dst=bases[b])
+                steps, sim, events, report = job.plan()
+                base_i = commit(steps, sim, events)
+                present.discard(a); present.add(b)
+                parts.append(f"{pallets[a].name}→{pallets[b].name}: {report.message}")
+            else:
+                job = PalletJob(self.kin, static_for({a}), pallets[a], opts,
+                                q_start=q_prev, radii=self._radii_cached())
+                steps, sim, events, report = job.plan()
+                events = {j: (("box_show", bases[a] + ev[1] - 1)
+                              if ev[0] == "drop_reveal" else ev)
+                          for j, ev in events.items()}
+                base_i = commit(steps, sim, events)
+                present.add(a)
+                parts.append(f"{pallets[a].name}: {report.message}")
+            q_prev = np.asarray(g_sim[-1], float)
+            if not report.ok:
+                ok = False
+                fail_cut = ((base_i - 1) + report.first_fail_sample + 1
+                            if report.first_fail_sample >= 0 else len(g_sim))
+                break
+        return dict(steps=g_steps, sim=np.asarray(g_sim, float), events=g_events,
+                    placed=placed_specs, ok=ok, fail_cut=fail_cut,
+                    initial_visible=initial_visible,
+                    message="   |   ".join(parts))
 
     def _cycle_estimate(self, sim, n_boxes: int) -> str:
         try:
@@ -539,49 +791,57 @@ class ScenePanel(QWidget):
             return ""
 
     def _simulate(self) -> None:
-        job, spec = self._build_job()
-        if job is None:
+        if not self.scene.pallets:
+            self.report_lbl.setText("No pallet yet — click ★ Add starter pallet.")
             return
         self._apply_speed(self.speed_box.currentText())
-        steps, sim, events, report = job.plan()
-        placements = generate_placements(spec)
-        self.viewport.build_placed_boxes(
-            [dict(T=p.T, half=p.half) for p in placements], color=spec.color)
-        self.viewport.set_placed_visible(0)
+        transfer = self._has_transfer()
+        res = self._plan_transfer_scene() if transfer else self._plan_sequence()
+        self.viewport.build_placed_boxes(res["placed"])
+        init = res.get("initial_visible")
+        if init is None:
+            self.viewport.set_placed_visible(0)
+        else:
+            self.viewport.set_boxes_visible(init)
+        sim, events = res["sim"], res["events"]
         # If infeasible, stop the animation right at the first failure so the
         # user sees exactly where and how it breaks.
-        if not report.ok and report.first_fail_sample >= 0:
-            cut = report.first_fail_sample + 1
+        if not res["ok"] and res["fail_cut"] >= 0:
+            cut = res["fail_cut"]
             sim = sim[:cut]
             events = {i: e for i, e in events.items() if i < cut}
-        # hand the job to the main window's render loop to animate
-        self.main_window.play_job(sim, events)
-        if report.ok:
-            tag = "✓ FEASIBLE"
-            extra = self._cycle_estimate(sim, spec.total_boxes())
-        elif spec.total_boxes() == 0:
+        self.main_window.play_job(sim, events, initial_visible=init)
+        total = sum(p.total_boxes() for p in self.scene.pallets)
+        n = len(self.scene.pallets)
+        scope = ("transfer" if transfer
+                 else (f"{n} pallets" if n > 1 else "1 pallet"))
+        if res["ok"]:
+            tag = f"✓ FEASIBLE ({scope})"
+            extra = self._cycle_estimate(res["sim"], total)
+        elif total == 0:
             tag = "⚠ CHECK DIMENSIONS"
             extra = ""
         else:
             tag = "✗ STOPPED AT FAILURE"
             extra = ""
-        self.report_lbl.setText(f"{tag} — {report.message}{extra}")
+        self.report_lbl.setText(f"{tag} — {res['message']}{extra}")
 
     def _to_program(self) -> None:
-        job, spec = self._build_job()
-        if job is None:
+        if not self.scene.pallets:
+            self.report_lbl.setText("No pallet yet — click ★ Add starter pallet.")
             return
-        steps, sim, events, report = job.plan()
-        if not steps:
+        res = (self._plan_transfer_scene() if self._has_transfer()
+               else self._plan_sequence())
+        if not res["steps"]:
             self.report_lbl.setText(
-                "Nothing to add — no boxes fit on the pallet. Increase the pallet "
-                "size or reduce the box/gaps.")
+                "Nothing to add — no boxes fit on the pallet(s). Increase the "
+                "pallet size or reduce the box/gaps.")
             return
-        self.program_panel.add_program_steps(steps)
-        tag = "feasible ✓" if report.ok else "NOT feasible ✗ — review before running"
+        self.program_panel.add_program_steps(res["steps"])
+        tag = "feasible ✓" if res["ok"] else "NOT feasible ✗ — review before running"
         self.report_lbl.setText(
-            f"Added {len(steps)} steps for '{spec.name}' to the Program ({tag}). "
-            f"{report.message}")
+            f"Added {len(res['steps'])} steps for {len(self.scene.pallets)} "
+            f"pallet(s) to the Program ({tag}). {res['message']}")
 
     # ---- render -----------------------------------------------------------
     def _render_scene(self) -> None:
@@ -603,13 +863,73 @@ class ScenePanel(QWidget):
                 f"{b.name}  {sz[0]:.0f}×{sz[1]:.0f}×{sz[2]:.0f} mm")
         row = self.pallet_list.currentRow()
         self.pallet_list.clear()
+        _role_tag = {"source": "  [SRC]", "destination": "  [DST]"}
         for p in self.scene.pallets:
             nx, ny = p.grid_counts()
             self.pallet_list.addItem(
                 f"{p.name}  {nx*ny}×{p.layers}L  @({p.T[0,3]*1000:.0f},"
-                f"{p.T[1,3]*1000:.0f}) mm")
+                f"{p.T[1,3]*1000:.0f}) mm{_role_tag.get(getattr(p, 'role', 'stack'), '')}")
         if 0 <= row < self.pallet_list.count():
             self.pallet_list.setCurrentRow(row)
+        self._rebuild_axes()          # keep origin gizmos in step with edits
+
+    # ---- origin-axis gizmos ----------------------------------------------
+    def _rebuild_axes(self, *_) -> None:
+        """(Re)draw the interactive origin gizmos for the toggled object types."""
+        gizmos = []
+        if self.ax_robot.isChecked():
+            gizmos.append((("robot", 0), self.kin.base_pose(), 0.30))
+        if self.ax_pallet.isChecked():
+            for i, p in enumerate(self.scene.pallets):
+                sc = float(np.clip(max(p.size[0], p.size[1]) * 0.5, 0.15, 0.40))
+                gizmos.append((("pallet", i), p.T, sc))
+        if self.ax_conveyor.isChecked():
+            for i, b in enumerate(self.scene.obstacles):
+                if b.kind == "conveyor":
+                    sc = float(np.clip(max(b.half[0], b.half[1]), 0.15, 0.40))
+                    gizmos.append((("obstacle", i), b.T, sc))
+        self.viewport.set_gizmos(gizmos)
+
+    def item_frame(self, ref) -> np.ndarray:
+        """The full 4×4 world frame of a scene item (for the gizmo)."""
+        kind, i = ref
+        if kind == "robot":
+            return self.kin.base_pose()
+        if kind == "pallet" and 0 <= i < len(self.scene.pallets):
+            return self.scene.pallets[i].T.copy()
+        if kind == "obstacle" and 0 <= i < len(self.scene.obstacles):
+            return self.scene.obstacles[i].T.copy()
+        return np.eye(4)
+
+    def set_item_pose(self, ref, T) -> None:
+        """Live re-pose of an item from a gizmo drag (model + one actor, no
+        full rebuild — keeps dragging smooth)."""
+        kind, i = ref
+        T = np.asarray(T, float)
+        if kind == "robot":
+            self.kin.set_base_pose(T)
+            self.viewport.update_joints(self.viewport._q)
+        elif kind == "pallet" and 0 <= i < len(self.scene.pallets):
+            self.scene.pallets[i].T = T.copy()
+            self.viewport.update_scene_actor(
+                ("pallet", i), self.scene.pallets[i].pallet_box().T)
+        elif kind == "obstacle" and 0 <= i < len(self.scene.obstacles):
+            self.scene.obstacles[i].T = T.copy()
+            self.viewport.update_scene_actor(("obstacle", i), T)
+
+    def gizmo_commit(self, ref) -> None:
+        """Finish a gizmo drag: refresh lists/collision (scene items) and redraw
+        the gizmos at the final pose."""
+        kind, _ = ref
+        if kind == "robot":
+            self._rebuild_axes()
+            p = self.kin.base_pose()[:3, 3]
+            self.report_lbl.setText(
+                f"Moved robot base to X={p[0]*1000:.0f} Y={p[1]*1000:.0f} "
+                f"Z={p[2]*1000:.0f} mm.")
+        else:
+            self.scene.changed.emit()          # refreshes lists + rebuilds axes
+            self.report_lbl.setText(f"Moved {self._ref_name(ref)}.")
 
     # ---- direct 3D-scene editing (select / drag / delete / resize) --------
     def _install_scene_controller(self) -> None:
@@ -776,6 +1096,7 @@ class _SceneEditController:
         self._null = vtk.vtkInteractorStyleUser()
         self._saved = None
         self._moving = False
+        self._giz = None                               # active gizmo-drag state
         self._mode = "xy"
         self._grab_off = np.zeros(2)
         self._z0 = 0.0
@@ -798,6 +1119,44 @@ class _SceneEditController:
         t = float(np.dot(pt - p0, n) / denom)
         return p0 + t * d
 
+    @staticmethod
+    def _axis_param(p0, p1, ob, db):
+        """Parameter s so ``ob + s·db`` is the point on the axis line closest to
+        the view ray p0→p1 (used to drag an object along a single axis)."""
+        d1 = p1 - p0
+        w0 = p0 - ob
+        a = float(np.dot(d1, d1)); b = float(np.dot(d1, db))
+        c = float(np.dot(db, db)); d = float(np.dot(d1, w0)); e = float(np.dot(db, w0))
+        den = a * c - b * b
+        if abs(den) < 1e-9:
+            return e / c if c > 1e-12 else None
+        return (a * e - b * d) / den
+
+    @staticmethod
+    def _perp_basis(a):
+        u = np.cross(a, [0.0, 0.0, 1.0])
+        if np.linalg.norm(u) < 1e-6:
+            u = np.cross(a, [0.0, 1.0, 0.0])
+        u = u / (np.linalg.norm(u) + 1e-12)
+        v = np.cross(a, u)
+        return u, v
+
+    @staticmethod
+    def _plane_angle(p, o, u, v):
+        w = p - o
+        return float(np.arctan2(float(np.dot(w, v)), float(np.dot(w, u))))
+
+    @staticmethod
+    def _axis_rot(a, ang):
+        a = np.asarray(a, float)
+        a = a / (np.linalg.norm(a) + 1e-12)
+        x, y, z = a
+        c, s = np.cos(ang), np.sin(ang)
+        C = 1.0 - c
+        return np.array([[c + x*x*C, x*y*C - z*s, x*z*C + y*s],
+                         [y*x*C + z*s, c + y*y*C, y*z*C - x*s],
+                         [z*x*C - y*s, z*y*C + x*s, c + z*z*C]])
+
     def _freeze(self):
         self._saved = self._iren.GetInteractorStyle()
         self._iren.SetInteractorStyle(self._null)
@@ -811,9 +1170,57 @@ class _SceneEditController:
                 pass
             self._saved = None
 
+    # ---- gizmo drag -------------------------------------------------------
+    def _begin_gizmo(self, g, x, y) -> None:
+        ref, axis, kind = g
+        T0 = self._p.item_frame(ref)
+        o0 = T0[:3, 3].copy()
+        a = T0[:3, axis].copy()
+        a = a / (np.linalg.norm(a) + 1e-12)
+        self._giz = dict(ref=ref, axis=axis, kind=kind, T0=T0.copy(), o0=o0, a=a)
+        p0, p1 = self._vp.world_ray(x, y)
+        if kind == "move":
+            s0 = self._axis_param(p0, p1, o0, a)
+            self._giz["s0"] = 0.0 if s0 is None else s0
+        else:
+            u, v = self._perp_basis(a)
+            self._giz["u"], self._giz["v"] = u, v
+            ph = self._ray_plane(p0, p1, o0, a)
+            self._giz["ang0"] = self._plane_angle(ph, o0, u, v) if ph is not None else 0.0
+        self._freeze()
+
+    def _gizmo_move(self, x, y) -> None:
+        g = self._giz
+        p0, p1 = self._vp.world_ray(x, y)
+        if g["kind"] == "move":
+            s = self._axis_param(p0, p1, g["o0"], g["a"])
+            if s is None:
+                return
+            new_o = g["o0"] + (s - g["s0"]) * g["a"]
+            T = g["T0"].copy(); T[:3, 3] = new_o
+            self._p.set_item_pose(g["ref"], T)
+            M = np.eye(4); M[:3, 3] = new_o - g["o0"]
+            self._vp.transform_gizmo(g["ref"], M)
+        else:
+            ph = self._ray_plane(p0, p1, g["o0"], g["a"])
+            if ph is None:
+                return
+            d_ang = self._plane_angle(ph, g["o0"], g["u"], g["v"]) - g["ang0"]
+            Rd = self._axis_rot(g["a"], d_ang)
+            T = g["T0"].copy()
+            T[:3, :3] = Rd @ g["T0"][:3, :3]
+            T[:3, 3] = g["o0"]
+            self._p.set_item_pose(g["ref"], T)
+            M = np.eye(4); M[:3, :3] = Rd; M[:3, 3] = g["o0"] - Rd @ g["o0"]
+            self._vp.transform_gizmo(g["ref"], M)
+
     # ---- observers --------------------------------------------------------
     def _press(self, obj, evt):
         x, y = self._iren.GetEventPosition()
+        g = self._vp.gizmo_pick(x, y)
+        if g is not None:
+            self._begin_gizmo(g, x, y)             # drag an origin-axis handle
+            return
         ref = self._vp.scene_pick(x, y)
         if ref is None:
             if self._p._sel_ref is not None:
@@ -837,6 +1244,10 @@ class _SceneEditController:
         self._freeze()
 
     def _move(self, obj, evt):
+        if self._giz is not None:
+            x, y = self._iren.GetEventPosition()
+            self._gizmo_move(x, y)
+            return
         if not self._moving:
             return
         x, y = self._iren.GetEventPosition()
@@ -855,6 +1266,12 @@ class _SceneEditController:
             self._p.drag_move(z=float(self._z0 + (hit[2] - self._hit0_z)))
 
     def _release(self, obj, evt):
+        if self._giz is not None:
+            ref = self._giz["ref"]
+            self._giz = None
+            self._thaw()
+            self._p.gizmo_commit(ref)
+            return
         if not self._moving:
             return
         self._moving = False

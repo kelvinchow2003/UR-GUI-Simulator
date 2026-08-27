@@ -75,6 +75,10 @@ class PalletSpec:
     nx: int = 0                # 0 ⇒ auto-fit from pallet/box/gap
     ny: int = 0
     color: str = "#d0a24c"
+    # Role in a run: "stack" = palletize onto it from the pick point/conveyor;
+    # "source" = it starts full and the robot depalletizes boxes off it;
+    # "destination" = the robot places depalletized boxes onto it.
+    role: str = "stack"
     # Where the tool contacts each box, in the box's own frame (metres from the
     # box centre). NaN ⇒ auto = top-face centre. The user can set this so the
     # robot grips a box from the top, an edge, or an offset "touch point".
@@ -208,11 +212,22 @@ def generate_placements(spec: PalletSpec) -> List[BoxPlacement]:
     idx = 0
     for layer in range(max(spec.layers, 0)):
         z = H + bh / 2.0 + layer * (bh + spec.layer_gap)     # local z (on slab top)
+        layer_boxes: List[np.ndarray] = []
         for (x, y, phi) in _layer_cells(spec, layer):
             local = np.array([x, y, z])
             T = np.eye(4)
             T[:3, :3] = R_pallet @ _rz(phi)                  # per-box yaw
             T[:3, 3] = R_pallet @ local + spec.T[:3, 3]
+            layer_boxes.append(T)
+        # Placement order within a layer: farthest-from-base first. The robot
+        # then always builds *away* from itself and retreats toward the base, so
+        # it never has to reach over an already-stacked box to set one behind it.
+        # This ordering alone removes most self-collisions in a full stack; the
+        # per-box motion planner in PalletJob handles whatever remains. Ties are
+        # broken deterministically so the visual reveal order stays stable.
+        layer_boxes.sort(key=lambda T: (-float(np.hypot(T[0, 3], T[1, 3])),
+                                        -float(T[1, 3]), -float(T[0, 3])))
+        for T in layer_boxes:
             placements.append(BoxPlacement(T=T, half=half.copy(),
                                            layer=layer, index=idx))
             idx += 1
@@ -310,16 +325,19 @@ class PalletJob:
         local[:3, 3] = -_R_DOWN.T @ gp
         return local, half
 
-    def _place_pose(self, place: BoxPlacement) -> np.ndarray:
-        """TCP pose to set a box down: tool at the box's grip point, pointing
-        down but **yawed to match the box** so a rotated box in an interlock or
-        brick layer is set with the gripper aligned to it."""
-        gp = self.spec.grip_point_local()
-        contact = place.T[:3, 3] + place.T[:3, :3] @ gp
+    @staticmethod
+    def _grip_pose(place: BoxPlacement, grip_local: np.ndarray) -> np.ndarray:
+        """TCP pose to grip a box (pick or place): tool at the box's grip point,
+        pointing down but yawed to match the box's orientation."""
+        contact = place.T[:3, 3] + place.T[:3, :3] @ np.asarray(grip_local, float)
         pose = np.eye(4)
         pose[:3, :3] = place.T[:3, :3] @ _R_DOWN     # down, yawed with the box
         pose[:3, 3] = contact
         return matrix_to_pose(pose)
+
+    def _place_pose(self, place: BoxPlacement) -> np.ndarray:
+        """TCP pose to set a box down on this job's pallet (see :meth:`_grip_pose`)."""
+        return self._grip_pose(place, self.spec.grip_point_local())
 
     @staticmethod
     def _lift(pose: np.ndarray, dz: float) -> np.ndarray:
@@ -334,13 +352,20 @@ class PalletJob:
         return p
 
     def _clearance_height(self) -> float:
-        """A safe transfer height above the whole finished stack + pick."""
+        """A safe transfer height above the whole finished stack, the pick, and
+        any static solid the tool must traverse over — e.g. boxes already stacked
+        on another pallet in a multi-pallet run. Routing the high traverse above
+        those keeps the carried box from sweeping through them; a genuine clip is
+        still caught by the collision check and reported."""
         s = self.spec
         stack_top = (float(s.T[2, 3]) + float(s.size[2])
                      + s.layers * float(s.box_size[2])
                      + max(s.layers - 1, 0) * s.layer_gap)
         pick_z = float(np.asarray(self.opts.pick_pose, float)[2])
-        return max(stack_top, pick_z) + self.opts.place_approach
+        carry_h = float(s.box_size[2])                 # box hangs below the TCP
+        static_top = max((float(b.T[2, 3] + b.half[2]) for b in self.static),
+                         default=0.0)
+        return max(stack_top, pick_z, static_top + carry_h) + self.opts.place_approach
 
     def _solve_best(self, pose, seed):
         """
@@ -400,6 +425,190 @@ class PalletJob:
                                        box=pb.name, distance=d)
         return None
 
+    # ---- adaptive height & approach helpers ------------------------------
+    def _adaptive_clear(self, placed: List[Box], place_pose: np.ndarray) -> float:
+        """Lowest transfer height that still clears everything already on the
+        pallet for THIS box — instead of one global height for the whole job.
+
+        Early boxes (near-empty pallet) travel low and fast; the height only
+        rises as the stack grows. The carried box hangs a full box-height below
+        the TCP (grip at its top face), so the tool must ride at least that far
+        above the tallest placed box. Never returns less than the global
+        clearance would *need* — it's a floor-raiser, not a safety relaxation.
+        """
+        s = self.spec
+        pallet_top = float(s.T[2, 3]) + float(s.size[2])
+        placed_top = max((float(b.T[2, 3] + b.half[2]) for b in placed),
+                         default=pallet_top)
+        carry_h = float(s.box_size[2])
+        pick_top = float(np.asarray(self.opts.pick_pose, float)[2])
+        base = max(placed_top + carry_h, pick_top, float(place_pose[2]))
+        return base + self.opts.place_approach
+
+    def _open_side(self, place: BoxPlacement,
+                   placed: List[Box]) -> Optional[np.ndarray]:
+        """A world-frame XY unit vector pointing to the most open side of a
+        placement — a side with no already-stacked neighbour — so the tool can
+        tuck the box in diagonally from there instead of plunging straight down
+        between two walls. Prefers the base-ward side (the arm naturally reaches
+        from there). Returns None when the box is free on all sides, in which
+        case a plain vertical descent is fine."""
+        s = self.spec
+        R = s.T[:3, :3]
+        origin = s.T[:3, 3]
+        px = float(s.box_size[0] + s.box_gap)
+        py = float(s.box_size[1] + s.box_gap)
+        tgt = R.T @ (place.T[:3, 3] - origin)            # target centre, local
+        occ = [(R.T @ (b.T[:3, 3] - origin))[:2] for b in placed]
+
+        def is_occ(cx, cy) -> bool:
+            return any(abs(lx - cx) < px * 0.5 and abs(ly - cy) < py * 0.5
+                       for lx, ly in occ)
+
+        open_dirs = []
+        for sx, sy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            if not is_occ(tgt[0] + sx * px, tgt[1] + sy * py):
+                w = R @ np.array([sx, sy, 0.0], float)
+                n = float(np.linalg.norm(w[:2]))
+                if n > 1e-9:
+                    open_dirs.append(w[:2] / n)
+        if len(open_dirs) == 4 or not open_dirs:
+            return None                                  # free (or boxed) all round
+        radial = place.T[:2, 3]
+        radial = radial / (float(np.linalg.norm(radial)) + 1e-9)
+        open_dirs.sort(key=lambda d: float(np.dot(d, radial)))   # base-ward first
+        return open_dirs[0]
+
+    def _plan_box(self, k: int, place: BoxPlacement, q_prev: np.ndarray,
+                  placed: List[Box], q_pick_clear: np.ndarray, q_pick: np.ndarray,
+                  world_ext: CollisionWorld, slab_world: CollisionWorld,
+                  local_carry: np.ndarray, carry_half: np.ndarray,
+                  clearance_bonus: float = 0.0,
+                  side: Optional[np.ndarray] = None,
+                  via_apex: bool = False,
+                  pick_pose: Optional[np.ndarray] = None,
+                  reveal_event: Optional[tuple] = None,
+                  pick_event: Optional[tuple] = None) -> dict:
+        """Plan ONE box's pick→place with a given avoidance strategy, build its
+        local sample buffer, and collision-check it. The caller tries a schedule
+        of strategies (higher clearance, side approach, mid-traverse apex) and
+        commits the first collision-free result into the global timeline.
+
+        Each leg is ``(move_type, pose, carrying, name, grip, event)`` so the
+        route length can vary (an apex via-point adds a leg) while step export
+        and timeline events stay index-independent. Returns a dict with the local
+        samples/events, the export legs+qs, reachability, and the first collision
+        (if any) as ``(result, local_sample_offset, leg_index)``.
+        """
+        o = self.opts
+        stride = max(1, int(o.coll_stride))
+        pick = np.asarray(o.pick_pose if pick_pose is None else pick_pose, float)
+        pick_clear = self._at_height(pick, self._clearance_height())
+
+        place_pose = self._place_pose(place)
+        z_clear = self._adaptive_clear(placed, place_pose) + clearance_bonus
+        place_clear = self._at_height(place_pose, z_clear)
+
+        # Side approach: nudge the high pre-descent point toward the open side so
+        # the tool comes in on a diagonal rather than straight down into a slot
+        # flanked by taller neighbours. The set-down target is unchanged.
+        if side is not None:
+            approach_hi = place_clear.copy()
+            approach_hi[:2] += side * float(np.min(self.spec.box_size[:2])) * 0.6
+        else:
+            approach_hi = place_clear
+
+        res_plc = self._solve_best(approach_hi, q_prev)
+        q_place_clear = res_plc.q
+        res_pl = self._solve_best(place_pose, q_place_clear)
+        q_place = res_pl.q
+        reachable = res_plc.success and res_pl.success
+
+        # legs: (move_type, pose, carrying, name, grip_after, event)
+        legs = [
+            ("J", pick_clear, False, "pick approach", "", ""),
+            ("L", pick, False, "pick", "close", ""),
+            ("L", pick_clear, True, "lift", "", "carry"),
+            ("J", approach_hi, True, "place approach", "", ""),
+            ("L", place_pose, True, "place", "open", ""),
+            ("L", approach_hi, False, "retract", "", "drop_reveal"),
+        ]
+        qs = [q_pick_clear, q_pick, q_pick_clear, q_place_clear, q_place, q_place_clear]
+
+        # Via-point insertion: a joint-space traverse between two high points can
+        # still bow *down* in Cartesian Z (joint-linear ≠ tool-linear), so raising
+        # the endpoints alone doesn't guarantee the carried box clears the stack
+        # mid-swing. When enabled, force the route up through an explicit apex over
+        # the midpoint so the tool is provably high across the whole traverse.
+        if via_apex and reachable:
+            # Apex sits directly ABOVE the place slot (same reachable posture
+            # family as the just-solved place-approach), only higher — so the arm
+            # rises over the slot before descending and the carried box is provably
+            # clear of the stack through the descent. Placing it over the geometric
+            # midpoint instead would risk the shoulder singularity near the base.
+            apex = approach_hi.copy()
+            apex[2] = max(float(pick_clear[2]), float(approach_hi[2])) + 0.08
+            res_apex = self._solve_best(apex, q_place_clear)
+            if res_apex.success:
+                legs.insert(3, ("J", apex, True, "traverse apex", "", ""))
+                qs.insert(3, res_apex.q)
+
+        # The current pallet's own already-placed boxes are a solid the ARM must
+        # not pass through — the tool tip legitimately grazes the box it's setting
+        # (absorbed by the penetration tolerance), but a forearm/upper-arm plunging
+        # through the stack is a real crash. (The carried box vs this stack is a
+        # separate, intended-contact check at set-down.)
+        stack_world = CollisionWorld(placed, self.radii) if placed else None
+
+        lsim: List[np.ndarray] = []
+        levents: Dict[int, tuple] = {}
+        leg_hit = None
+        for li, leg in enumerate(legs):
+            _, _, carrying, _, _, event = leg
+            q0 = q_prev if li == 0 else qs[li - 1]
+            q1 = qs[li]
+            seg = self.planner.joint_move(q0, q1, o.sim_steps)
+            carried_box = Box(half=carry_half, T=local_carry, name=f"box{k}") \
+                if carrying else None
+            base_off = len(lsim)
+            lsim.extend(seg[1:].tolist())
+            if leg_hit is None:
+                for j in range(1, len(seg), stride):
+                    res = world_ext.check(self.kin, seg[j], margin=o.margin,
+                                          carried=carried_box,
+                                          carried_obstacles=world_ext.boxes)
+                    if res.hit:
+                        leg_hit = (res, base_off + j - 1, li)
+                        break
+                    res_s = slab_world.check(self.kin, seg[j],
+                                             margin=-o.surface_tol)
+                    if res_s.hit:
+                        leg_hit = (res_s, base_off + j - 1, li)
+                        break
+                    # arm links vs the stack being built (tool grazing tolerated)
+                    if stack_world is not None:
+                        res_st = stack_world.check(self.kin, seg[j],
+                                                   margin=-o.surface_tol)
+                        if res_st.hit:
+                            leg_hit = (res_st, base_off + j - 1, li)
+                            break
+                # carried box vs the already-placed stack — checked only at the
+                # settled set-down leg so it stays O(boxes), not O(boxes²·samples).
+                if (leg_hit is None and leg[3] == "place"
+                        and placed and carried_box is not None):
+                    hit = self._carried_stack_overlap(q1, carried_box, placed)
+                    if hit is not None:
+                        leg_hit = (hit, len(lsim) - 1, li)
+            if event == "carry":
+                levents[base_off] = ("carry", local_carry.copy(), carry_half.copy())
+                if pick_event is not None:          # e.g. hide the source box now
+                    levents[base_off + 1] = pick_event
+            elif event == "drop_reveal":
+                levents[base_off] = (reveal_event if reveal_event is not None
+                                     else ("drop_reveal", k + 1))
+        return {"reachable": reachable, "leg_hit": leg_hit, "lsim": lsim,
+                "levents": levents, "legs": legs, "qs": qs}
+
     # ---- the plan ---------------------------------------------------------
     def plan(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
         placements = generate_placements(self.spec)
@@ -434,7 +643,6 @@ class PalletJob:
         z_clear = self._clearance_height()
         pick_clear = self._at_height(pick, z_clear)     # high transfer height
         pallet_slab = self.spec.pallet_box()
-        stride = max(1, int(self.opts.coll_stride))
 
         # --- pick side is IDENTICAL for every box, so solve it ONCE ----------
         # (its poses don't depend on k). This alone removes ~half of all IK
@@ -448,103 +656,81 @@ class PalletJob:
         # Two collision worlds with different intent:
         #   * external solids (guarding, pedestals, other pallets) get the full
         #     user safety margin — the arm must stay well clear of these.
-        #   * the pallet slab is the *work surface* the tool must approach to
-        #     stack onto, so it is checked with NO margin (true penetration
-        #     only). Otherwise a fat conservative capsule + margin would flag the
-        #     arm every time it reaches over the pallet, even though it clears.
-        world_ext = CollisionWorld(self.static, self.radii)
-        slab_world = CollisionWorld([pallet_slab], self.radii)
+        #   * work surfaces — the pallet slab AND any conveyor — are approached
+        #     by the tool on purpose (place onto the pallet, pick a box off the
+        #     belt), so they are checked arm-only with a penetration tolerance
+        #     instead of the full margin. A conveyor also must NOT be tested
+        #     against the carried box, or lifting a box off the belt (contact
+        #     distance ≈ 0) would read as a crash. A genuine deep plunge into
+        #     either still penetrates past the tolerance and is caught.
+        surfaces = [b for b in self.static if b.kind == "conveyor"]
+        solids = [b for b in self.static if b.kind != "conveyor"]
+        world_ext = CollisionWorld(solids, self.radii)
+        slab_world = CollisionWorld([pallet_slab] + surfaces, self.radii)
         placed: List[Box] = []
-        seed = q_pick_clear
 
         for k, place in enumerate(placements):
             st = BoxStatus(index=k, layer=place.layer)
-            place_pose = self._place_pose(place)
-            place_clear = self._at_height(place_pose, z_clear)
+            q_prev = sim[-1]                 # config the arm arrives in
 
-            # Only the PLACE side varies per box → 2 IK solves (traverse target
-            # + set-down). The retract reuses the traverse solution.
-            res_plc = self._solve_best(place_clear, seed)
-            q_place_clear = res_plc.q
-            res_pl = self._solve_best(place_pose, q_place_clear)
-            q_place = res_pl.q
-            st.reachable = pick_reachable and res_plc.success and res_pl.success
+            # Collision-aware planning: instead of committing one fixed motion and
+            # merely *reporting* a crash, try a schedule of avoidance strategies —
+            # cheapest first — and keep the first one that's collision-free. The
+            # arm effectively "thinks": lift higher, or tuck in from the box's open
+            # side, before giving up. A feasible box normally succeeds on the first
+            # (nominal) try, so clean stacks stay fast.
+            strategies = [dict(clearance_bonus=0.0, side=None)]
+            # Once the job already has a first failure, its verdict is sealed and
+            # the animation stops there anyway — so don't burn the full retry
+            # schedule on every remaining box; the nominal route still emits a
+            # complete exportable program.
+            if report.first_failure < 0:
+                strategies += [dict(clearance_bonus=0.06, side=None),
+                               dict(clearance_bonus=0.12, side=None)]
+                side = self._open_side(place, placed)
+                if side is not None:
+                    strategies += [dict(clearance_bonus=0.06, side=side),
+                                   dict(clearance_bonus=0.12, side=side)]
+                # last resort: force the traverse up through an explicit apex so
+                # the carried box provably clears the stack across the whole swing.
+                strategies.append(dict(clearance_bonus=0.12, side=None, via_apex=True))
+                if side is not None:
+                    strategies.append(dict(clearance_bonus=0.12, side=side, via_apex=True))
 
-            # motion waypoints. Traverses (legs 0 & 3) happen at a common
-            # clearance height above the whole stack, so the carried box never
-            # sweeps through already-placed boxes during the joint-space move —
-            # exactly how a real palletizer routes: up, across high, straight down.
-            legs = [
-                ("J", pick_clear, False),   # 0 go high above pick
-                ("L", pick, False),         # 1 descend to pick
-                ("L", pick_clear, True),    # 2 lift to clearance (now carrying)
-                ("J", place_clear, True),   # 3 traverse high above slot (carrying)
-                ("L", place_pose, True),    # 4 descend to place (carrying)
-                ("L", place_clear, False),  # 5 retract to clearance (released)
-            ]
-            qs = [q_pick_clear, q_pick, q_pick_clear,
-                  q_place_clear, q_place, q_place_clear]
+            best = None
+            for params in strategies:
+                best = self._plan_box(k, place, q_prev, placed,
+                                      q_pick_clear, q_pick, world_ext, slab_world,
+                                      local_carry, carry_half, **params)
+                if not (pick_reachable and best["reachable"]):
+                    break               # unreachable target — re-routing won't help
+                if best["leg_hit"] is None:
+                    break               # collision-free strategy found — take it
 
-            box_start = len(sim)         # first sim sample belonging to this box
-            leg_hit = None
-            for li in range(len(legs)):
-                q0 = sim[-1] if li == 0 else qs[li - 1]
-                q1 = qs[li]
-                seg = self.planner.joint_move(q0, q1, self.opts.sim_steps)
-                carrying = legs[li][2]
-                carried_box = Box(half=carry_half, T=local_carry, name=f"box{k}") \
-                    if carrying else None
-                base_i = len(sim)
-                sim.extend(seg[1:].tolist())
-                if leg_hit is None:
-                    for j in range(1, len(seg), stride):
-                        # arm + carried box vs external solids (with safety margin)
-                        res = world_ext.check(self.kin, seg[j], margin=self.opts.margin,
-                                              carried=carried_box,
-                                              carried_obstacles=self.static)
-                        if res.hit:
-                            leg_hit = (res, base_i + j - 1)
-                            break
-                        # arm vs the pallet work surface — a negative margin
-                        # gives the tolerance that absorbs the conservative
-                        # capsule inflation (see JobOptions.surface_tol).
-                        res_s = slab_world.check(self.kin, seg[j],
-                                                 margin=-self.opts.surface_tol)
-                        if res_s.hit:
-                            leg_hit = (res_s, base_i + j - 1)
-                            break
-                    # carried box vs the already-placed stack — flag only a real
-                    # *overlap* (boxes on a pallet are meant to touch), and only
-                    # at the settled set-down sample so it stays O(boxes) not
-                    # O(boxes²·samples).
-                    if leg_hit is None and li == 4 and placed and carried_box is not None:
-                        hit = self._carried_stack_overlap(qs[li], carried_box, placed)
-                        if hit is not None:
-                            leg_hit = (hit, len(sim) - 1)
-                # timeline events: attach carried box on leg 2 start, reveal + drop
-                if li == 2:
-                    events[base_i] = ("carry", local_carry.copy(), carry_half.copy())
-                if li == 5:
-                    events[base_i] = ("drop_reveal", k + 1)  # release + show box k
+            # commit the chosen (best) strategy into the global timeline
+            base = len(sim)             # first sim sample belonging to this box
+            box_start = base
+            sim.extend(best["lsim"])
+            for off, ev in best["levents"].items():
+                events[base + off] = ev
+            self._emit_steps(steps, best["legs"], best["qs"])
 
+            st.reachable = pick_reachable and best["reachable"]
+            leg_hit = best["leg_hit"]
             if leg_hit is not None:
                 st.collided = True
                 res = leg_hit[0]
                 st.detail = f"{res.link} ↔ {res.box} (d={res.distance*1000:.0f} mm)"
 
-            # export steps (always emitted so a program can still be produced)
-            self._emit_steps(steps, legs, qs)
-
             report.statuses.append(st)
             if (not st.reachable or st.collided) and report.first_failure < 0:
                 report.first_failure = k
                 report.ok = False
-                report.first_fail_sample = (leg_hit[1] if (st.collided and leg_hit)
-                                            else box_start)
+                report.first_fail_sample = (base + leg_hit[1]
+                                            if (st.collided and leg_hit) else box_start)
                 report.message = self._failure_message(k, place, st)
 
             placed.append(place.to_box(f"{self.spec.name}:box{k}"))
-            seed = q_place_clear
 
         if report.ok:
             report.message = (
@@ -575,26 +761,149 @@ class PalletJob:
 
     # ---- URScript steps ---------------------------------------------------
     def _emit_steps(self, steps: List[ProgramStep], legs, qs) -> None:
+        """Emit exportable program steps for one box's route. Iterates the leg
+        metadata so a variable-length route (e.g. one with a traverse-apex via)
+        exports correctly and the gripper open/close land on the right legs."""
         o = self.opts
-        names = ["pick approach", "pick", "lift", "place approach", "place", "retract"]
-
-        def move(mt, pose, q, name):
+        for (mt, pose, _carry, name, grip, _event), q in zip(legs, qs):
             if mt == "J":
-                steps.append(ProgramStep(StepType.MOVEJ, name=name, q=list(map(float, q)),
+                steps.append(ProgramStep(StepType.MOVEJ, name=name,
+                                         q=list(map(float, q)),
                                          speed=o.speed_j, accel=o.accel_j))
             else:
                 steps.append(ProgramStep(StepType.MOVEL, name=name,
                                          pose=list(map(float, pose)),
                                          speed=o.speed_l, accel=o.accel_l))
+            if grip == "close":
+                steps.append(ProgramStep(StepType.GRIPPER_CLOSE, name="grip"))
+            elif grip == "open":
+                steps.append(ProgramStep(StepType.GRIPPER_OPEN, name="release"))
 
-        # 0,1
-        move(*legs[0][:2], qs[0], names[0])
-        move(*legs[1][:2], qs[1], names[1])
-        steps.append(ProgramStep(StepType.GRIPPER_CLOSE, name="grip"))
-        # 2,3,4
-        move(*legs[2][:2], qs[2], names[2])
-        move(*legs[3][:2], qs[3], names[3])
-        move(*legs[4][:2], qs[4], names[4])
-        steps.append(ProgramStep(StepType.GRIPPER_OPEN, name="release"))
-        # 5
-        move(*legs[5][:2], qs[5], names[5])
+
+# ===========================================================================
+#  Depalletize → palletize transfer (pallet-to-pallet)
+# ===========================================================================
+class TransferJob(PalletJob):
+    """Move a full pallet's load onto another pallet: pick each box off the
+    **source** (top layer first) and place it onto the **destination** in the
+    normal stacking order.
+
+    Reuses :class:`PalletJob`'s per-box motion planner and collision-avoidance
+    strategies. ``self.spec`` is the destination (so ``_place_pose`` / clearance
+    logic target it); the source stack shrinks box-by-box, and its remaining
+    boxes stay in the obstacle set so the arm never crashes into what's left.
+
+    ``base_src`` / ``base_dst`` are global box-index offsets so the timeline can
+    hide the right source box and reveal the right destination box during play.
+    """
+
+    def __init__(self, kin, static_obstacles, source_spec: PalletSpec,
+                 dest_spec: PalletSpec, opts: Optional[JobOptions] = None,
+                 q_start: Optional[np.ndarray] = None,
+                 radii: Optional[Dict[str, float]] = None,
+                 base_src: int = 0, base_dst: int = 0):
+        super().__init__(kin, static_obstacles, dest_spec, opts, q_start, radii)
+        self.source_spec = source_spec
+        self.base_src = int(base_src)
+        self.base_dst = int(base_dst)
+
+    def plan(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
+        src_pls = generate_placements(self.source_spec)
+        dst_pls = generate_placements(self.spec)
+        report = PalletReport(ok=True)
+        if not src_pls or not dst_pls:
+            report.ok = False
+            report.message = ("Transfer needs boxes on the source pallet and free "
+                              "slots on the destination pallet — check both sizes.")
+            return [], np.asarray([self.q_start], float), {}, report
+
+        n_src = len(src_pls)
+        count = min(n_src, len(dst_pls))
+        steps: List[ProgramStep] = []
+        sim: List[np.ndarray] = [self.q_start.copy()]
+        events: Dict[int, tuple] = {}
+        local_carry, carry_half = self._carried_local()
+        dst_slab = self.spec.pallet_box()
+        src_slab = self.source_spec.pallet_box()
+        src_grip = self.source_spec.grip_point_local()
+        base_solids = [b for b in self.static if b.kind != "conveyor"]
+        base_surfaces = [b for b in self.static if b.kind == "conveyor"]
+        placed_dst: List[Box] = []
+
+        for i in range(count):
+            src_box = src_pls[n_src - 1 - i]           # depalletize top-first
+            dst_place = dst_pls[i]                      # palletize in stacking order
+            pick_pose = self._grip_pose(src_box, src_grip)
+
+            # Remaining source boxes (below/around the one being picked) are a
+            # work surface the tool descends into to grip the top box: checked
+            # arm-only with the penetration tolerance (like the pallet slab and
+            # the destination stack) so the wrist grazing a neighbour is fine but
+            # a link plunging through the stack is still caught. The destination
+            # growing stack is handled inside _plan_box (via the ``placed`` arg).
+            remaining = [src_pls[j].to_box(f"{self.source_spec.name}:box{j}")
+                         for j in range(n_src - 1 - i)]
+            world_ext = CollisionWorld(base_solids, self.radii)
+            slab_world = CollisionWorld(base_surfaces + [dst_slab, src_slab] + remaining,
+                                        self.radii)
+
+            pick_clear = self._at_height(pick_pose, self._clearance_height())
+            res_pc = self._solve_best(pick_clear, sim[-1])
+            res_pk = self._solve_best(pick_pose, res_pc.q)
+            q_pick_clear, q_pick = res_pc.q, res_pk.q
+            pick_reachable = res_pc.success and res_pk.success
+
+            strategies = [dict(clearance_bonus=0.0, side=None)]
+            if report.first_failure < 0:
+                strategies += [dict(clearance_bonus=0.06, side=None),
+                               dict(clearance_bonus=0.12, side=None)]
+                sd = self._open_side(dst_place, placed_dst)
+                if sd is not None:
+                    strategies += [dict(clearance_bonus=0.06, side=sd),
+                                   dict(clearance_bonus=0.12, side=sd)]
+                strategies.append(dict(clearance_bonus=0.12, side=None, via_apex=True))
+
+            src_g = self.base_src + (n_src - 1 - i)
+            dst_g = self.base_dst + i
+            best = None
+            for params in strategies:
+                best = self._plan_box(
+                    i, dst_place, sim[-1], placed_dst, q_pick_clear, q_pick,
+                    world_ext, slab_world, local_carry, carry_half,
+                    pick_pose=pick_pose,
+                    reveal_event=("box_show", dst_g),
+                    pick_event=("box_hide", src_g), **params)
+                if not (pick_reachable and best["reachable"]):
+                    break
+                if best["leg_hit"] is None:
+                    break
+
+            base = len(sim)
+            sim.extend(best["lsim"])
+            for off, ev in best["levents"].items():
+                events[base + off] = ev
+            self._emit_steps(steps, best["legs"], best["qs"])
+
+            st = BoxStatus(index=i, layer=dst_place.layer)
+            st.reachable = pick_reachable and best["reachable"]
+            leg_hit = best["leg_hit"]
+            if leg_hit is not None:
+                st.collided = True
+                res = leg_hit[0]
+                st.detail = f"{res.link} ↔ {res.box} (d={res.distance*1000:.0f} mm)"
+            report.statuses.append(st)
+            if (not st.reachable or st.collided) and report.first_failure < 0:
+                report.first_failure = i
+                report.ok = False
+                report.first_fail_sample = (base + leg_hit[1]
+                                            if (st.collided and leg_hit) else base)
+                report.message = self._failure_message(i, dst_place, st)
+
+            placed_dst.append(dst_place.to_box(f"{self.spec.name}:box{i}"))
+
+        if report.ok:
+            report.message = (
+                f"Transferred {count} boxes: {self.source_spec.name} → "
+                f"{self.spec.name} ({self.spec.layers} layers, "
+                f"{self.spec.pattern} pattern).")
+        return steps, np.asarray(sim, float), events, report

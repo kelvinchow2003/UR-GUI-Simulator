@@ -138,6 +138,8 @@ class Kinematics:
         self.q_min = np.asarray(model.q_min, dtype=float)
         self.q_max = np.asarray(model.q_max, dtype=float)
         self._tcp = np.eye(4)           # tool0 -> TCP offset
+        self._base = np.eye(4)          # world -> robot base (mount) transform
+        self.base_height = 0.0          # metres the base is lifted (pedestal)
         self._load_urdf(model.name)
         # kept for any legacy reference; kinematics now use the URDF chain
         self.a = np.asarray(model.a, dtype=float)
@@ -161,6 +163,30 @@ class Kinematics:
         """Set the TCP offset from tool0 ([x,y,z,rx,ry,rz])."""
         self._tcp = np.eye(4) if pose is None else pose_to_matrix(pose)
 
+    def set_base_height(self, z: float) -> None:
+        """Mount the whole robot ``z`` metres above the floor (e.g. on a
+        pedestal). Every FK frame — and therefore the rendered twin, the
+        collision capsules, and the world-frame poses IK solves against — is
+        lifted by ``z``, so a box placed under the base raises the robot instead
+        of being buried in the floor. ``z=0`` restores a floor-mounted robot.
+
+        Only the base's Z is changed; any X/Y position or rotation set via
+        :meth:`set_base_pose` (e.g. by dragging the robot's origin gizmo) is
+        preserved, so the pedestal height and a repositioned robot coexist."""
+        self.base_height = float(z)
+        self._base[2, 3] = float(z)
+
+    def set_base_pose(self, T: np.ndarray) -> None:
+        """Set the full world→base transform (position + orientation). Used to
+        drag/rotate the whole robot around the cell. FK/IK/collision/rendering
+        all follow, since every FK frame is premultiplied by this base."""
+        self._base = np.asarray(T, float).reshape(4, 4).copy()
+        self.base_height = float(self._base[2, 3])
+
+    def base_pose(self) -> np.ndarray:
+        """Current world→base transform (position + orientation)."""
+        return self._base.copy()
+
     # ---- forward kinematics (exact UR URDF chain) ------------------------
     def fk_frames(self, q: np.ndarray) -> List[np.ndarray]:
         """
@@ -176,8 +202,8 @@ class Kinematics:
         the placement of UR's real visual meshes.
         """
         q = np.asarray(q, dtype=float)
-        frames = [np.eye(4)]
-        F = np.eye(4)
+        frames = [self._base.copy()]              # base lifted by any mount height
+        F = self._base.copy()
         for i in range(6):
             F = F @ self._O[i] @ _rotz(q[i])
             frames.append(F.copy())
@@ -188,7 +214,7 @@ class Kinematics:
     def tool0(self, q: np.ndarray) -> np.ndarray:
         """The UR tool0 frame (flange TCP) without any extra tool offset."""
         q = np.asarray(q, dtype=float)
-        F = np.eye(4)
+        F = self._base.copy()
         for i in range(6):
             F = F @ self._O[i] @ _rotz(q[i])
         return F @ self._flange @ self._tool0

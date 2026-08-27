@@ -168,6 +168,9 @@ class RobotViewport(QWidget):
         self._placed_actors: List = []        # pallet boxes (revealed as stacked)
         self._carried_actor = None            # box currently in the gripper
         self._carried_half = None
+        self._gizmo_actors: List = []         # transform-gizmo handle actors
+        self._gizmo_meta: List = []           # [(actor, ref, axis, kind)]  kind=move|rot
+        self._giz_uid = 0                      # unique-name counter for handles
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -615,6 +618,42 @@ class RobotViewport(QWidget):
                 pass
         return actor
 
+    def _conveyor_mesh(self, half: np.ndarray):
+        """A conveyor-shaped mesh (lower frame + two side rails + a row of
+        rollers across the belt) built in the local frame, so it reads as a
+        conveyor rather than a plain box. Returned as one merged PolyData."""
+        hx, hy, hz = (float(half[0]), float(half[1]), float(half[2]))
+        rail_t = float(np.clip(min(hx, hy) * 0.10, 0.008, 0.05))
+        parts = []
+        # lower frame body (solid base of the conveyor)
+        parts.append(pv.Box(bounds=(-hx, hx, -hy, hy, -hz, -hz + 2 * hz * 0.40)))
+        # two side rails running the length, up to belt height
+        parts.append(pv.Box(bounds=(-hx, hx, hy - rail_t, hy, -hz, hz)))
+        parts.append(pv.Box(bounds=(-hx, hx, -hy, -hy + rail_t, -hz, hz)))
+        # rollers across the width, spaced along the length, sitting at the top
+        r = float(np.clip(min(hz * 0.4, (hy - rail_t) * 0.35), 0.006, 0.03))
+        n = int(np.clip((2 * hx) / (2.3 * r), 5, 60))
+        roller_len = 2.0 * (hy - rail_t) * 0.98
+        for x in np.linspace(-hx + r, hx - r, n):
+            parts.append(pv.Cylinder(center=(float(x), 0.0, hz - r),
+                                     direction=(0.0, 1.0, 0.0), radius=r,
+                                     height=roller_len, resolution=14))
+        return pv.merge(parts)
+
+    def _add_conveyor(self, T, half, color, opacity, name):
+        """Add a conveyor as a single actor (posed by ``T``) so picking / gizmo
+        drag treat it like any other scene item. Falls back to a plain box if
+        the composite mesh can't be built."""
+        try:
+            mesh = self._conveyor_mesh(np.asarray(half, float))
+            actor = self.plotter.add_mesh(
+                mesh, color=color, opacity=opacity, name=name, pickable=False,
+                reset_camera=False, smooth_shading=True)
+            self._set_matrix(actor, np.asarray(T, float))
+            return actor
+        except Exception:                       # noqa: BLE001
+            return self._add_box(T, half, color, opacity, name)
+
     def set_scene_boxes(self, specs) -> None:
         """Render static obstacles + pallet slabs. ``specs``: dicts with
         T, half, color, opacity, name, optional ref + ``selected``. Rebuilt on
@@ -629,9 +668,14 @@ class RobotViewport(QWidget):
         for i, s in enumerate(specs or []):
             sel = bool(s.get("selected", False))
             opacity = s.get("opacity", 0.35)
-            actor = self._add_box(
-                s["T"], s["half"], s.get("color", "#bf616a"),
-                min(0.85, opacity + 0.25) if sel else opacity, f"scene_{i}")
+            draw_opacity = min(0.95, opacity + 0.25) if sel else opacity
+            if s.get("kind") == "conveyor":
+                actor = self._add_conveyor(s["T"], s["half"],
+                                           s.get("color", "#434c5e"),
+                                           draw_opacity, f"scene_{i}")
+            else:
+                actor = self._add_box(s["T"], s["half"], s.get("color", "#bf616a"),
+                                      draw_opacity, f"scene_{i}")
             if sel:
                 try:
                     actor.prop.edge_color = "#ebcb8b"
@@ -673,6 +717,107 @@ class RobotViewport(QWidget):
                 self.plotter.render()
                 return
 
+    # ---- transform gizmos (origin axes + drag/rotate handles) -------------
+    _GIZMO_COLORS = ("#bf616a", "#a3be8c", "#5e81ac")   # X=red, Y=green, Z=blue
+
+    def set_gizmos(self, gizmos) -> None:
+        """Draw an interactive origin gizmo for each entry.
+
+        ``gizmos``: list of ``(ref, T, scale)`` — ``ref`` is the scene handle the
+        panel understands (('robot',0) / ('pallet',i) / ('obstacle',i)), ``T`` a
+        4×4 world frame, ``scale`` the arm length in metres. Each gizmo shows a
+        3-axis triad whose **arrows translate** along that axis and whose **rings
+        rotate** about it. Every handle actor is recorded so a pick maps back to
+        (ref, axis, kind)."""
+        self.clear_gizmos()
+        if not _HAVE_PV:
+            return
+        for ref, T, scale in (gizmos or []):
+            try:
+                self._build_one_gizmo(ref, np.asarray(T, float), float(scale))
+            except Exception as exc:                # noqa: BLE001
+                import logging
+                logging.getLogger("ur_gui.window").exception(
+                    "gizmo build failed for %s: %s", ref, exc)
+        self.plotter.render()
+
+    def clear_gizmos(self) -> None:
+        if not _HAVE_PV:
+            return
+        for a in self._gizmo_actors:
+            self._safe_remove(a)
+        self._gizmo_actors.clear()
+        self._gizmo_meta.clear()
+
+    def _build_one_gizmo(self, ref, T, scale) -> None:
+        o = T[:3, 3]
+        for axis in range(3):
+            self._giz_uid += 1
+            direction = T[:3, axis]
+            arrow = pv.Arrow(start=o, direction=direction, scale=scale,
+                             tip_length=0.28, tip_radius=0.09, shaft_radius=0.032)
+            a = self.plotter.add_mesh(arrow, color=self._GIZMO_COLORS[axis],
+                                      pickable=True, name=f"giz{self._giz_uid}",
+                                      reset_camera=False)
+            self._gizmo_actors.append(a)
+            self._gizmo_meta.append((a, ref, axis, "move"))
+        for axis in range(3):
+            self._giz_uid += 1
+            ring = self._ring_polydata(o, T[:3, axis], scale * 0.92)
+            a = self.plotter.add_mesh(ring, color=self._GIZMO_COLORS[axis],
+                                      pickable=True, name=f"giz{self._giz_uid}",
+                                      opacity=0.9, reset_camera=False)
+            self._gizmo_actors.append(a)
+            self._gizmo_meta.append((a, ref, axis, "rot"))
+
+    @staticmethod
+    def _ring_polydata(center, axis, radius, n=64, tube=0.008):
+        axis = np.asarray(axis, float)
+        axis = axis / (np.linalg.norm(axis) + 1e-12)
+        u = np.cross(axis, [0.0, 0.0, 1.0])
+        if np.linalg.norm(u) < 1e-6:
+            u = np.cross(axis, [0.0, 1.0, 0.0])
+        u = u / (np.linalg.norm(u) + 1e-12)
+        v = np.cross(axis, u)
+        ts = np.linspace(0.0, 2 * np.pi, n)
+        pts = (np.asarray(center, float)
+               + radius * (np.outer(np.cos(ts), u) + np.outer(np.sin(ts), v)))
+        poly = pv.lines_from_points(np.vstack([pts, pts[0]]))
+        return poly.tube(radius=tube)
+
+    def gizmo_pick(self, x, y):
+        """Return ``(ref, axis, kind)`` for the gizmo handle under display
+        coords (x, y), or None. ``kind`` is 'move' or 'rot'."""
+        if not _HAVE_PV or not self._gizmo_meta:
+            return None
+        try:
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(0.02)
+            picker.PickFromListOn()
+            picker.InitializePickList()
+            for a, _r, _ax, _k in self._gizmo_meta:
+                picker.AddPickList(a)
+            if picker.Pick(x, y, 0, self.plotter.renderer) and \
+                    picker.GetActor() is not None:
+                addr = picker.GetActor().GetAddressAsString("")
+                for a, ref, axis, kind in self._gizmo_meta:
+                    if a.GetAddressAsString("") == addr:
+                        return (ref, axis, kind)
+        except Exception:                       # noqa: BLE001
+            return None
+        return None
+
+    def transform_gizmo(self, ref, M) -> None:
+        """Apply world transform ``M`` (4×4) to just the handle actors of ``ref``
+        — smooth visual feedback during a drag without rebuilding meshes."""
+        if not _HAVE_PV:
+            return
+        M = np.asarray(M, float)
+        for a, r, _ax, _k in self._gizmo_meta:
+            if r == ref:
+                self._set_matrix(a, M)
+        self.plotter.render()
+
     def world_ray(self, x, y):
         """Two world points (near, far) along the click ray at display (x, y)."""
         ren = self.plotter.renderer
@@ -704,8 +849,10 @@ class RobotViewport(QWidget):
         for i, pl in enumerate(placements or []):
             T = pl["T"] if isinstance(pl, dict) else pl.T
             half = pl["half"] if isinstance(pl, dict) else pl.half
+            col = pl.get("color", color) if isinstance(pl, dict) else color
             self._placed_actors.append(
-                self._add_box(T, half, color, 0.92, f"placed_{i}", visible=False))
+                self._add_box(T, half, col or color, 0.92, f"placed_{i}",
+                              visible=False))
         self.plotter.render()
 
     def set_placed_visible(self, n) -> None:
@@ -717,6 +864,31 @@ class RobotViewport(QWidget):
             except Exception:                   # noqa: BLE001
                 pass
         self.plotter.render()
+
+    def set_boxes_visible(self, indices) -> None:
+        """Show exactly the boxes at ``indices`` (hide the rest). Used to seed a
+        depalletize run where the source pallet's boxes start visible."""
+        if not _HAVE_PV:
+            return
+        want = {int(i) for i in (indices or [])}
+        for i, a in enumerate(self._placed_actors):
+            try:
+                a.SetVisibility(i in want)
+            except Exception:                   # noqa: BLE001
+                pass
+        self.plotter.render()
+
+    def set_box_visible(self, i, on: bool = True) -> None:
+        """Show/hide a single placed box (reveal a placed box, or make a picked
+        source box disappear)."""
+        if not _HAVE_PV:
+            return
+        if 0 <= int(i) < len(self._placed_actors):
+            try:
+                self._placed_actors[int(i)].SetVisibility(bool(on))
+            except Exception:                   # noqa: BLE001
+                pass
+            self.plotter.render()
 
     def set_carried_box(self, T, half=None) -> None:
         """Re-pose (or create/remove) the box currently held at the TCP."""
