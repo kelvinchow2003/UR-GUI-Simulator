@@ -35,7 +35,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox, QLabel,
     QPushButton, QDoubleSpinBox, QSpinBox, QListWidget, QComboBox,
-    QMenu, QInputDialog, QCheckBox,
+    QMenu, QInputDialog, QCheckBox, QApplication,
 )
 
 from robot.collision import Box, CollisionWorld, link_radii
@@ -346,7 +346,8 @@ class ScenePanel(QWidget):
         brow = QHBoxLayout()
         for label, fn in (("Preview placements", self._preview),
                           ("Simulate palletization", self._simulate),
-                          ("Add program → Program", self._to_program)):
+                          ("Add program → Program", self._to_program),
+                          ("Export to RoboDK", self._to_robodk)):
             b = QPushButton(label); b.clicked.connect(fn); brow.addWidget(b)
         jg.addLayout(brow, 4, 0, 1, 4)
         self.report_lbl = QLabel("New here? Click ★ Add starter pallet, then "
@@ -877,6 +878,43 @@ class ScenePanel(QWidget):
         self.report_lbl.setText(
             f"Added {len(res['steps'])} steps for {len(self.scene.pallets)} "
             f"pallet(s) to the Program ({tag}). {res['message']}")
+
+    def _to_robodk(self) -> None:
+        """Rebuild the current pallet job in RoboDK and report the limits its own
+        kinematic/collision engine finds (reachability, collisions, cycle time)."""
+        if not self.scene.pallets:
+            self.report_lbl.setText("No pallet yet — click ★ Add starter pallet.")
+            return
+        res = (self._plan_transfer_scene() if self._has_transfer()
+               else self._plan_sequence())
+        if not res["steps"]:
+            self.report_lbl.setText(
+                "Nothing to export — no boxes fit on the pallet(s). Increase the "
+                "pallet size or reduce the box/gaps.")
+            return
+        self.report_lbl.setText("Exporting to RoboDK — building the station…")
+        QApplication.processEvents()
+        try:
+            from robot.robodk_export import export_scene_to_robodk, RoboDKUnavailable
+        except Exception as exc:                        # noqa: BLE001
+            self.report_lbl.setText(f"RoboDK export unavailable: {exc}")
+            return
+        try:
+            rep = export_scene_to_robodk(
+                self.kin,
+                obstacles=[b for b in self.scene.obstacles if b.enabled],
+                pallets=list(self.scene.pallets),
+                steps=res["steps"],
+                placed=res.get("placed"),
+                robot_name=getattr(self.kin.model, "name", None),
+            )
+        except RoboDKUnavailable as exc:
+            self.report_lbl.setText(f"RoboDK: {exc}")
+            return
+        except Exception as exc:                         # noqa: BLE001
+            self.report_lbl.setText(f"RoboDK export failed: {exc}")
+            return
+        self.report_lbl.setText(rep.text)
 
     # ---- render -----------------------------------------------------------
     def _render_scene(self) -> None:

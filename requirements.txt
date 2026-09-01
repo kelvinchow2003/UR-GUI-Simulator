@@ -40,3 +40,8 @@ scipy>=1.10                # Rotation, KD-trees, interpolation for trajectories
 # ----- Code editor niceties (optional) --------------------------------------
 QScintilla>=2.14           # rich script editor with syntax highlighting.
 Pygments>=2.17             # fallback highlighter if QScintilla is absent
+
+# ----- Offline-programming export (optional) --------------------------------
+robodk>=5.5                # "Export to RoboDK": rebuild the palletizing cell in
+                           # RoboDK to check reach/collisions/cycle time on its
+                           # own engine. Needs the RoboDK desktop app running.
