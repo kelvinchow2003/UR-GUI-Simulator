@@ -87,6 +87,18 @@ class Box:
         T[:3, 3] = np.asarray(center, float)
         return cls(half=np.asarray(size, float) / 2.0, T=T, name=name, kind=kind)
 
+    # ---- (de)serialisation ------------------------------------------------
+    def to_dict(self) -> dict:
+        return {"half": self.half.tolist(), "T": self.T.tolist(),
+                "name": self.name, "kind": self.kind, "enabled": self.enabled}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Box":
+        return cls(half=np.asarray(d["half"], float),
+                   T=np.asarray(d["T"], float),
+                   name=d.get("name", "box"), kind=d.get("kind", "obstacle"),
+                   enabled=bool(d.get("enabled", True)))
+
     def corners(self) -> np.ndarray:
         """World-frame 8 corners (for rendering / bounds)."""
         s = self.half

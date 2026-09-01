@@ -1,0 +1,30 @@
+{
+  // Run/Debug configs for the UR GUI Simulator. These launch main.py explicitly
+  // (not the "current file"), so F5 works no matter which panel has focus —
+  // fixing the "Variable ${file} can not be resolved" error you hit when Run was
+  // pressed while the terminal, not an editor tab, was focused.
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "UR GUI Simulator",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": true
+    },
+    {
+      "name": "UR GUI Simulator (connect to robot)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--connect", "--log", "DEBUG"],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "python": "${workspaceFolder}/.venv/Scripts/python.exe",
+      "justMyCode": true
+    }
+  ]
+}

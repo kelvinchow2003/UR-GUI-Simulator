@@ -27,9 +27,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 from robot.kinematics import (
-    Kinematics, TrajectoryPlanner, matrix_to_pose, matrix_to_rotvec,
+    Kinematics, TrajectoryPlanner, IKResult, matrix_to_pose, matrix_to_rotvec,
 )
 from robot.collision import Box, CollisionWorld
+from robot.posture import PostureOptimizer, PostureWeights
 from robot.program import ProgramStep, StepType
 
 # tool pointing straight down: tool +Z = world −Z (180° about X)
@@ -90,6 +91,49 @@ class PalletSpec:
         self.box_size = np.asarray(self.box_size, float).reshape(3)
         self.T = np.asarray(self.T, float).reshape(4, 4)
         self.grip_point = np.asarray(self.grip_point, float).reshape(3)
+
+    # ---- (de)serialisation ------------------------------------------------
+    def to_dict(self) -> dict:
+        # grip_point may hold NaN (⇒ "auto top-centre"); JSON has no NaN, so
+        # store those components as null and restore them on load.
+        gp = [None if np.isnan(v) else float(v) for v in self.grip_point]
+        return {
+            "name": self.name,
+            "size": self.size.tolist(),
+            "T": self.T.tolist(),
+            "box_size": self.box_size.tolist(),
+            "box_weight_kg": float(self.box_weight_kg),
+            "pattern": self.pattern,
+            "layers": int(self.layers),
+            "box_gap": float(self.box_gap),
+            "layer_gap": float(self.layer_gap),
+            "nx": int(self.nx),
+            "ny": int(self.ny),
+            "color": self.color,
+            "role": self.role,
+            "grip_point": gp,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PalletSpec":
+        gp = d.get("grip_point", [None, None, None])
+        grip = np.array([np.nan if v is None else float(v) for v in gp], float)
+        return cls(
+            name=d.get("name", "Pallet 1"),
+            size=np.asarray(d["size"], float),
+            T=np.asarray(d["T"], float),
+            box_size=np.asarray(d["box_size"], float),
+            box_weight_kg=float(d.get("box_weight_kg", 1.0)),
+            pattern=d.get("pattern", "column"),
+            layers=int(d.get("layers", 3)),
+            box_gap=float(d.get("box_gap", 0.005)),
+            layer_gap=float(d.get("layer_gap", 0.0)),
+            nx=int(d.get("nx", 0)),
+            ny=int(d.get("ny", 0)),
+            color=d.get("color", "#d0a24c"),
+            role=d.get("role", "stack"),
+            grip_point=grip,
+        )
 
     def grip_point_local(self) -> np.ndarray:
         """Resolved box-local contact point (defaults to the top-face centre)."""
@@ -260,6 +304,10 @@ class JobOptions:
     coll_stride: int = 2                    # collision-check every Nth sample
     ik_max_iter: int = 80                   # IK iteration cap while planning
     ik_seeds: int = 3                       # posture seeds tried per target
+    # Collision-aware posture optimisation: enumerate IK branches (elbow/wrist/
+    # base variants) and pick the one that clears the world, instead of taking
+    # whatever branch the seed happened to land on. Off ⇒ legacy seed-loop.
+    smart_posture: bool = True
 
     @classmethod
     def fast(cls, **kw) -> "JobOptions":
@@ -305,6 +353,16 @@ class PalletJob:
         self.q_start = (np.asarray(q_start, float) if q_start is not None
                         else np.array([0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]))
         self.planner = TrajectoryPlanner(kin)
+        # Collision-aware posture engine. Continuity is weighted high so the arm
+        # stays on its current IK branch whenever that branch is already clear,
+        # and only switches to a different branch when the near one would collide
+        # (the collision-free bonus guarantees a clear branch always wins). This
+        # keeps consecutive legs on a coherent posture rather than hopping.
+        self.smart = bool(getattr(self.opts, "smart_posture", True))
+        self.posture = PostureOptimizer(
+            kin, PostureWeights(clearance=12.0, clearance_cap=0.08,
+                                singularity=1.0, limit=1.0,
+                                elbow_up=3.0, continuity=2.0))
 
     # ---- carried-box geometry (in the TCP frame) -------------------------
     def _carried_local(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -367,22 +425,33 @@ class PalletJob:
                          default=0.0)
         return max(stack_top, pick_z, static_top + carry_h) + self.opts.place_approach
 
-    def _solve_best(self, pose, seed):
+    def _solve_best(self, pose, seed, world: Optional[CollisionWorld] = None,
+                    margin: Optional[float] = None):
         """
-        IK with posture selection: try the chained seed plus a few canonical
-        *elbow-up* seeds (base rotated toward the target) and keep the
-        successful solution whose whole arm stays **highest** (largest minimum
-        link-origin z). This avoids the damped-least-squares solver settling
-        into an elbow-down posture that dips under the table / into the pallet
-        — a solution that is kinematically valid but not how a palletizer moves.
+        IK with posture selection. When ``smart_posture`` is on *and* a collision
+        ``world`` is supplied, this defers to :class:`PostureOptimizer`, which
+        enumerates the reachable IK branches and returns the one that clears the
+        world (falling back to the least-bad posture if none do) — so the arm
+        actively re-postures around an obstacle instead of taking whatever branch
+        the seed landed on. High continuity weighting keeps it on the seed's
+        branch whenever that branch is already collision-free.
 
-        The number of seeds and the IK iteration cap come from
-        :class:`JobOptions` so a "fast" preset can trade a little robustness for
-        much quicker planning (unreachable targets are the expensive case, since
-        they never converge and otherwise burn the full iteration budget on
-        every seed).
+        Otherwise it uses the legacy seed loop: try the chained seed plus a few
+        canonical *elbow-up* seeds and keep the successful solution whose whole
+        arm stays **highest** (largest minimum link-origin z), avoiding an
+        elbow-down posture that dips under the table / into the pallet.
         """
         pose = np.asarray(pose, float)
+        if self.smart and world is not None:
+            m = self.opts.margin if margin is None else margin
+            res = self.posture.solve(pose, world=world, q_ref=seed, margin=m,
+                                     max_iter=int(self.opts.ik_max_iter))
+            if res.best is not None:
+                return IKResult(q=res.best.q, success=res.ok, iterations=0,
+                                pos_error=0.0, rot_error=0.0)
+            # nothing reachable — fall through to the legacy solver for a seed
+            # it can at least report an error from
+
         theta = float(np.arctan2(pose[1], pose[0]))
         all_seeds = [
             np.asarray(seed, float),
@@ -518,9 +587,18 @@ class PalletJob:
         else:
             approach_hi = place_clear
 
-        res_plc = self._solve_best(approach_hi, q_prev)
+        # Arm-avoid world for posture selection: external solids, the boxes
+        # already stacked, AND the pallet slab / work surfaces. The slab is
+        # included so the optimiser rejects an elbow-down branch that dips a link
+        # into the pallet (it may reach the box *on* the slab, but the arm itself
+        # must stay above it) — which is exactly the elbow-up posture a palletiser
+        # wants. The real set-down check still applies the surface tolerance.
+        avoid = CollisionWorld(list(world_ext.boxes) + list(placed)
+                               + list(slab_world.boxes), self.radii)
+
+        res_plc = self._solve_best(approach_hi, q_prev, world=avoid)
         q_place_clear = res_plc.q
-        res_pl = self._solve_best(place_pose, q_place_clear)
+        res_pl = self._solve_best(place_pose, q_place_clear, world=avoid)
         q_place = res_pl.q
         reachable = res_plc.success and res_pl.success
 
@@ -548,7 +626,7 @@ class PalletJob:
             # midpoint instead would risk the shoulder singularity near the base.
             apex = approach_hi.copy()
             apex[2] = max(float(pick_clear[2]), float(approach_hi[2])) + 0.08
-            res_apex = self._solve_best(apex, q_place_clear)
+            res_apex = self._solve_best(apex, q_place_clear, world=avoid)
             if res_apex.success:
                 legs.insert(3, ("J", apex, True, "traverse apex", "", ""))
                 qs.insert(3, res_apex.q)
@@ -644,15 +722,6 @@ class PalletJob:
         pick_clear = self._at_height(pick, z_clear)     # high transfer height
         pallet_slab = self.spec.pallet_box()
 
-        # --- pick side is IDENTICAL for every box, so solve it ONCE ----------
-        # (its poses don't depend on k). This alone removes ~half of all IK
-        # solves, the dominant planning cost.
-        res_pc = self._solve_best(pick_clear, self.q_start)
-        q_pick_clear = res_pc.q
-        res_pk = self._solve_best(pick, q_pick_clear)
-        q_pick = res_pk.q
-        pick_reachable = res_pc.success and res_pk.success
-
         # Two collision worlds with different intent:
         #   * external solids (guarding, pedestals, other pallets) get the full
         #     user safety margin — the arm must stay well clear of these.
@@ -668,6 +737,17 @@ class PalletJob:
         world_ext = CollisionWorld(solids, self.radii)
         slab_world = CollisionWorld([pallet_slab] + surfaces, self.radii)
         placed: List[Box] = []
+
+        # --- pick side is IDENTICAL for every box, so solve it ONCE ----------
+        # (its poses don't depend on k). This alone removes ~half of all IK
+        # solves, the dominant planning cost. Posture is chosen to clear the
+        # external solids (the pick approaches over an empty area, away from the
+        # pallet stack, so the slab isn't an obstacle here).
+        res_pc = self._solve_best(pick_clear, self.q_start, world=world_ext)
+        q_pick_clear = res_pc.q
+        res_pk = self._solve_best(pick, q_pick_clear, world=world_ext)
+        q_pick = res_pk.q
+        pick_reachable = res_pc.success and res_pk.success
 
         for k, place in enumerate(placements):
             st = BoxStatus(index=k, layer=place.layer)
@@ -848,8 +928,12 @@ class TransferJob(PalletJob):
                                         self.radii)
 
             pick_clear = self._at_height(pick_pose, self._clearance_height())
-            res_pc = self._solve_best(pick_clear, sim[-1])
-            res_pk = self._solve_best(pick_pose, res_pc.q)
+            # Posture-avoid the external solids plus the source boxes still below
+            # the one being lifted, so the arm re-postures around the shrinking
+            # source stack instead of plunging a link through it.
+            avoid_pick = CollisionWorld(list(world_ext.boxes) + remaining, self.radii)
+            res_pc = self._solve_best(pick_clear, sim[-1], world=avoid_pick)
+            res_pk = self._solve_best(pick_pose, res_pc.q, world=avoid_pick)
             q_pick_clear, q_pick = res_pc.q, res_pk.q
             pick_reachable = res_pc.success and res_pk.success
 

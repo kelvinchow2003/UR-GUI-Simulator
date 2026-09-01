@@ -32,6 +32,23 @@ class SceneModel(QObject):
         self.obstacles: List[Box] = []
         self.pallets: List[PalletSpec] = []
 
+    # ---- (de)serialisation ------------------------------------------------
+    def to_dict(self) -> dict:
+        """The whole editable world (obstacles + pallets) as plain data."""
+        return {"obstacles": [b.to_dict() for b in self.obstacles],
+                "pallets": [p.to_dict() for p in self.pallets]}
+
+    def load_dict(self, d: dict) -> None:
+        """Replace the scene contents from a saved dict and notify views once."""
+        self.obstacles = [Box.from_dict(x) for x in d.get("obstacles", [])]
+        self.pallets = [PalletSpec.from_dict(x) for x in d.get("pallets", [])]
+        self.changed.emit()
+
+    def clear(self) -> None:
+        self.obstacles = []
+        self.pallets = []
+        self.changed.emit()
+
     # ---- obstacles --------------------------------------------------------
     def add_obstacle(self, box: Box) -> None:
         self.obstacles.append(box)

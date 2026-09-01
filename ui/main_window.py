@@ -66,6 +66,7 @@ class MainWindow(QMainWindow):
         self.program = Program(name="Untitled")
         self.scene = SceneModel(self)
         self._coll_radii = None
+        self._project_path: str | None = None      # current .urgproj file, if any
 
         self.setWindowTitle("UR GUI Simulator")
         self.resize(1500, 950)
@@ -143,6 +144,25 @@ class MainWindow(QMainWindow):
     def _menu(self) -> None:
         mb = self.menuBar()
 
+        # File: whole-session project save/open (.urgproj) — model + base pose +
+        # program + scene, so a user can pick up exactly where they left off.
+        file_menu = mb.addMenu("&File")
+        for text, seq, fn in (
+                ("New Project", QKeySequence.StandardKey.New, self._new_project),
+                ("Open Project…", QKeySequence.StandardKey.Open, self._open_project),
+                (None, None, None),
+                ("Save Project", QKeySequence.StandardKey.Save, self._save_project),
+                ("Save Project As…", QKeySequence("Ctrl+Shift+S"),
+                 self._save_project_as)):
+            if text is None:
+                file_menu.addSeparator()
+                continue
+            act = QAction(text, self)
+            act.setShortcut(seq)
+            act.triggered.connect(fn)
+            file_menu.addAction(act)
+            self.addAction(act)
+
         # Edit: undo/redo/copy/paste for scene objects. Qt shortcuts fire while
         # the app window is active (including when the 3D view has focus), which
         # VTK's own key handling does not do reliably for Ctrl+key combos.
@@ -203,6 +223,107 @@ class MainWindow(QMainWindow):
             "Digital twin, teach pendant, CAD toolpaths and dual-mode "
             "code generation for Universal Robots.<br><br>"
             f"RTDE backend: {'available' if URBridge.rtde_available() else 'socket/sim fallback'}")
+
+    # ---- project save / open ---------------------------------------------
+    def _gather_project(self) -> str:
+        from robot.project import project_to_json
+        return project_to_json(self.model.name, self.kin.base_pose(),
+                               self.program, self.scene)
+
+    def _apply_project(self, data: dict) -> None:
+        """Restore a loaded project onto the *live* objects the panels share
+        (so nothing needs to be rebuilt). Order matters: set the model first
+        (which resets kinematics), load the program and scene, then restore the
+        exact base pose last so a pedestal mount / repositioning survives."""
+        from robot.program import Program
+        from robot.ur_models import MODEL_NAMES
+        # 1) robot model — setting the combo fires _on_model_changed, which
+        #    rebuilds kinematics + viewport for the new arm.
+        name = data.get("model")
+        if name in MODEL_NAMES and name != self.model.name:
+            self.connection_panel.model_box.setCurrentText(name)
+        # 2) program, mutated in place so program_panel/editor_panel keep working.
+        self.program.load_from(Program.from_dict(data.get("program", {})))
+        self.program_panel.refresh()
+        self.program_panel.program_changed.emit()
+        # 3) scene (emits changed → scene_panel refresh + pedestal base-height sync).
+        self.scene.load_dict(data.get("scene", {}))
+        # 4) exact base pose (pedestal height + any drag/rotate) — after the scene
+        #    load, whose auto base-height sync would otherwise clobber the z.
+        bp = data.get("base_pose")
+        if bp is not None:
+            self.kin.set_base_pose(np.asarray(bp, float))
+            q = getattr(self.viewport, "_q", None)
+            if q is not None:
+                self.viewport.update_joints(q)          # re-pose the twin, lifted
+            self.scene_panel._rebuild_axes()
+
+    def _new_project(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        from robot.program import Program
+        if QMessageBox.question(
+                self, "New Project",
+                "Start a new project? Any unsaved changes will be lost.") \
+                != QMessageBox.StandardButton.Yes:
+            return
+        self.program.load_from(Program(name="Untitled"))
+        self.program_panel.refresh()
+        self.program_panel.program_changed.emit()
+        self.scene.clear()
+        self._project_path = None
+        self._update_title()
+        self._set_status("New project.")
+
+    def _open_project(self) -> None:
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+        from robot.project import project_from_json, EXTENSION
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project", "", f"UR GUI project (*{EXTENSION})")
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = project_from_json(fh.read())
+            self._apply_project(data)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Open Project", f"Could not open:\n{exc}")
+            return
+        self._project_path = path
+        self._update_title()
+        self._set_status(f"Opened project {path}")
+
+    def _save_project(self) -> None:
+        if self._project_path is None:
+            self._save_project_as()
+            return
+        self._write_project(self._project_path)
+
+    def _save_project_as(self) -> None:
+        from PySide6.QtWidgets import QFileDialog
+        from robot.project import EXTENSION
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Project As", "", f"UR GUI project (*{EXTENSION})")
+        if not path:
+            return
+        if not path.lower().endswith(EXTENSION):
+            path += EXTENSION
+        self._write_project(path)
+
+    def _write_project(self, path: str) -> None:
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(self._gather_project())
+        except OSError as exc:
+            QMessageBox.warning(self, "Save Project", f"Could not save:\n{exc}")
+            return
+        self._project_path = path
+        self._update_title()
+        self._set_status(f"Saved project {path}")
+
+    def _update_title(self) -> None:
+        name = os.path.basename(self._project_path) if self._project_path else None
+        self.setWindowTitle("UR GUI Simulator" + (f" — {name}" if name else ""))
 
     # ---- status bar + log -------------------------------------------------
     def _status(self) -> None:

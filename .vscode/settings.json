@@ -1,0 +1,6 @@
+{
+  // Use the project's virtual environment (PySide6 / numpy / robodk live here)
+  // for Run, Debug, and new integrated terminals.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.terminal.activateEnvironment": true
+}

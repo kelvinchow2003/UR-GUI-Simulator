@@ -340,6 +340,14 @@ class ScenePanel(QWidget):
                                   "planning while iterating. Re-run without it "
                                   "to confirm a job before exporting.")
         pb.addWidget(self.fast_plan)
+        self.smart_posture = QCheckBox("Smart posture")
+        self.smart_posture.setChecked(True)
+        self.smart_posture.setToolTip(
+            "Collision-aware IK: the arm enumerates its reachable postures "
+            "(elbow/wrist/base variants) and picks one that clears the pallet, "
+            "the stack, and obstacles — instead of whatever the solver lands on. "
+            "Turn off to compare against the plain solver.")
+        pb.addWidget(self.smart_posture)
         pb.addStretch(1)
         jg.addLayout(pb, 3, 0, 1, 4)
 
@@ -654,7 +662,8 @@ class ScenePanel(QWidget):
                       pick_approach=self.appr_pick.value() / 1000,
                       place_approach=self.appr_place.value() / 1000,
                       speed_l=self.job_speed.value(),
-                      margin=self.margin.value() / 1000)
+                      margin=self.margin.value() / 1000,
+                      smart_posture=self.smart_posture.isChecked())
         return (JobOptions.fast(**common) if self.fast_plan.isChecked()
                 else JobOptions(**common))
 

@@ -138,20 +138,19 @@ class Program:
         return None
 
     # ---- persistence ------------------------------------------------------
-    def to_json(self) -> str:
-        return json.dumps({
+    def to_dict(self) -> dict:
+        return {
             "name": self.name,
-            "tcp": self.tcp,
+            "tcp": list(self.tcp),
             "default_j_speed": self.default_j_speed,
             "default_j_accel": self.default_j_accel,
             "default_l_speed": self.default_l_speed,
             "default_l_accel": self.default_l_accel,
             "steps": [s.to_dict() for s in self.steps],
-        }, indent=2)
+        }
 
     @classmethod
-    def from_json(cls, text: str) -> "Program":
-        d = json.loads(text)
+    def from_dict(cls, d: dict) -> "Program":
         prog = cls(
             name=d.get("name", "Untitled"),
             tcp=d.get("tcp", [0, 0, 0, 0, 0, 0]),
@@ -162,6 +161,24 @@ class Program:
         )
         prog.steps = [ProgramStep.from_dict(s) for s in d.get("steps", [])]
         return prog
+
+    def load_from(self, other: "Program") -> None:
+        """Copy another program's contents *in place*, so panels holding a
+        reference to this instance see the update without being rebuilt."""
+        self.name = other.name
+        self.tcp = list(other.tcp)
+        self.steps = other.steps
+        self.default_j_speed = other.default_j_speed
+        self.default_j_accel = other.default_j_accel
+        self.default_l_speed = other.default_l_speed
+        self.default_l_accel = other.default_l_accel
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), indent=2)
+
+    @classmethod
+    def from_json(cls, text: str) -> "Program":
+        return cls.from_dict(json.loads(text))
 
 
 # ===========================================================================
