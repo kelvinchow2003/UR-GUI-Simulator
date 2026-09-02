@@ -336,6 +336,17 @@ class ProgramPanel(QWidget):
                     f"⚠ Collision at sample {idx}/{len(path)}: "
                     f"{res.link} ↔ {res.box}.")
         self.simulate_requested.emit(path)
+        # A 7th-axis program's joint targets were each solved for a robot
+        # standing at a particular rail position. This view replays joints only
+        # against a fixed base, so say so rather than showing a plausible-
+        # looking run that is in the wrong place half the time.
+        if any(s.enabled and s.type is StepType.RAIL_MOVE
+               for s in self.program.steps):
+            self.status.emit(
+                f"Simulating {len(path)} samples — ⚠ the 7th axis is NOT moved "
+                f"in this view. Use the Scene panel's Simulate palletization to "
+                f"see the actuator index.")
+            return
         self.status.emit(f"Simulating {len(path)} trajectory samples…")
 
     def _execute(self) -> None:

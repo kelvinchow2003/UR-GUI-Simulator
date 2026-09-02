@@ -426,6 +426,7 @@ class RoboDKExporter:
         prog.setPoseFrame(self.frame)
         prog.setPoseTool(self.tool)
         n_targets = 0
+        n_rail = 0
         for i, s in enumerate(steps):
             if not s.enabled:
                 continue
@@ -450,8 +451,25 @@ class RoboDKExporter:
                 prog.waitDI(int(s.pin), 1)
             elif t is StepType.DELAY:
                 prog.Pause(float(s.duration) * 1000.0)
+            elif t is StepType.RAIL_MOVE:
+                # RoboDK models a 7th axis as a linear-rail *mechanism*, which
+                # this exporter does not build. Emit the move as a visible
+                # instruction and warn, rather than dropping it silently: the
+                # joint targets around it were solved for a robot standing at
+                # that rail position, so a station without the rail would
+                # report reach and collision results for the wrong cell.
+                prog.RunInstruction(
+                    f"7th axis -> {float(s.rail_pos) * 1000:.0f} mm",
+                    rl.INSTRUCTION_COMMENT)
+                n_rail += 1
             elif t is StepType.COMMENT:
                 prog.RunInstruction(s.text or "", rl.INSTRUCTION_COMMENT)
+        if n_rail:
+            self.warnings.append(
+                f"{n_rail} 7th-axis move(s) exported as comments — RoboDK is "
+                f"NOT driving the rail, so its reach/collision verdict here "
+                f"applies to a robot fixed at its starting mount position. "
+                f"Trust the app's own simulation for the rail-indexed job.")
         self.program = prog
         self.n_targets = n_targets
         return prog

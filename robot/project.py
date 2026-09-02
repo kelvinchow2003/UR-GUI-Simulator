@@ -33,18 +33,26 @@ VERSION = 1
 EXTENSION = ".urgproj"
 
 
-def project_to_json(model_name: str, base_pose, program: "Program",
-                    scene: "SceneModel") -> str:
-    """Serialise the full session state to an indented JSON string."""
-    data = {
+def project_dict(model_name: str, base_pose, program_dict: dict,
+                 scene_dict: dict) -> dict:
+    """Assemble the project payload from already-serialised parts. Lets non-GUI
+    callers (e.g. the MCP server) build a project without a live ``SceneModel``."""
+    return {
         "format": FORMAT,
         "version": VERSION,
         "model": str(model_name),
         "base_pose": np.asarray(base_pose, float).reshape(4, 4).tolist(),
-        "program": program.to_dict(),
-        "scene": scene.to_dict(),
+        "program": program_dict,
+        "scene": scene_dict,
     }
-    return json.dumps(data, indent=2)
+
+
+def project_to_json(model_name: str, base_pose, program: "Program",
+                    scene: "SceneModel") -> str:
+    """Serialise the full session state to an indented JSON string."""
+    return json.dumps(
+        project_dict(model_name, base_pose, program.to_dict(), scene.to_dict()),
+        indent=2)
 
 
 def project_from_json(text: str) -> dict:

@@ -45,3 +45,8 @@ Pygments>=2.17             # fallback highlighter if QScintilla is absent
 robodk>=5.5                # "Export to RoboDK": rebuild the palletizing cell in
                            # RoboDK to check reach/collisions/cycle time on its
                            # own engine. Needs the RoboDK desktop app running.
+
+# ----- Natural-language control via Claude Desktop (optional) ---------------
+mcp>=1.2                   # MCP server (mcp_server.py) that lets Claude Desktop
+                           # build simulations from instructions. See the module
+                           # docstring for the claude_desktop_config.json setup.

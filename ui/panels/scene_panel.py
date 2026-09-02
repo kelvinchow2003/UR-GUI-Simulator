@@ -3,7 +3,7 @@ ui/panels/scene_panel.py
 ==================================================================
 Scene & Palletizer dock.
 
-Two cooperating tools built on the shared :class:`robot.scene.SceneModel`:
+Three cooperating tools built on the shared :class:`robot.scene.SceneModel`:
 
     * **Obstacles** — create rectangular collision volumes (e.g. a pedestal
       under the robot, guarding, fixtures). The arm must not hit them; the
@@ -17,6 +17,14 @@ Two cooperating tools built on the shared :class:`robot.scene.SceneModel`:
       and collisions, stopping at the first failure. Pallets can be copied,
       moved and deleted, and the whole job exported into the Program as a
       real, runnable UR program.
+
+    * **7th axis** — mount the robot on a linear actuator: a vertical lift
+      column, or a horizontal track. *Recommend travel* works out where the
+      carriage has to stand for every layer of the selected pallet — and
+      therefore how much stroke the actuator needs — then applies it. The
+      palletizer indexes the actuator as it builds, so a stack taller (or a
+      run longer) than the arm's own envelope becomes buildable, and the
+      exported program carries the actuator moves alongside the arm moves.
 
 Everything is base-frame metres, shown to the user in millimetres.
 
@@ -42,8 +50,13 @@ from robot.collision import Box, CollisionWorld, link_radii
 from robot.palletizer import (
     PalletSpec, JobOptions, PalletJob, TransferJob, generate_placements,
 )
+from robot.rail import AXIS_LABELS, MODES, recommend_rail
 
 _ROLES = ["stack", "source", "destination"]     # role_box index → PalletSpec.role
+_RAIL_AXES = ["Z", "X", "Y"]                    # rail_axis index → RailSpec.axis
+_RAIL_MODE_LABELS = ["Fixed mount (never moves)",
+                     "Index per layer",
+                     "Index per pick & place"]
 
 
 def _spin(lo, hi, val, dec=0, step=10.0, suffix="") -> QDoubleSpinBox:
@@ -77,6 +90,7 @@ class ScenePanel(QWidget):
         self._paste_n = 0                   # cascade successive pastes
         self._pre_snap = None               # snapshot captured at a drag start
         self._moved = False                 # did the current drag change anything
+        self._rail_loading = False          # suppress form→model while loading
         self._build()
         self.scene.changed.connect(self._render_scene)
         self._render_scene()
@@ -295,6 +309,9 @@ class ScenePanel(QWidget):
         pg.addLayout(prow, 13, 0, 1, 4)
         root.addWidget(pl)
 
+        # ---------- 7th axis ----------
+        root.addWidget(self._build_rail_group())
+
         # ---------- palletize / simulate ----------
         job = QGroupBox("Palletize  (pick → place)")
         jg = QGridLayout(job)
@@ -375,6 +392,263 @@ class ScenePanel(QWidget):
         self.apply_model_defaults()
         self._update_fit()
         self._apply_speed(self.speed_box.currentText())   # default 2× playback
+
+    # ---- 7th axis UI ------------------------------------------------------
+    def _build_rail_group(self) -> QGroupBox:
+        """The linear actuator the robot itself rides on.
+
+        Sits between the pallet definition and the palletize controls because
+        that is the order the decisions happen in: describe the stack, size the
+        actuator that can build it, then run the job.
+        """
+        g = QGroupBox("7th axis  (robot on a linear actuator)")
+        lay = QGridLayout(g)
+
+        info = QLabel("Mount the arm on a lift column or a track. A tall pallet "
+                      "that the arm can only half-reach becomes buildable: the "
+                      "actuator indexes up a notch per layer, and the robot works "
+                      "from there. Recommend travel sizes the stroke from the box "
+                      "size and layer count of the selected pallet.")
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#5e81ac;font-size:10px")
+        lay.addWidget(info, 0, 0, 1, 4)
+
+        self.rail_on = QCheckBox("Robot is mounted on a linear actuator")
+        self.rail_on.setToolTip("Anchors the actuator at the robot's current mount "
+                                "point, so enabling it never moves the arm — it "
+                                "just gives it a stroke to travel along.")
+        self.rail_on.toggled.connect(self._rail_enable_toggled)
+        lay.addWidget(self.rail_on, 1, 0, 1, 4)
+
+        lay.addWidget(QLabel("Axis / mode"), 2, 0)
+        self.rail_axis = QComboBox()
+        self.rail_axis.addItems([AXIS_LABELS[a] for a in _RAIL_AXES])
+        self.rail_axis.setToolTip(
+            "Z = a vertical lift column (raise/lower the robot to palletize "
+            "higher or lower).\nX / Y = a horizontal track (traverse the robot "
+            "between stations further apart than its own reach).")
+        lay.addWidget(self.rail_axis, 2, 1)
+        self.rail_mode = QComboBox()
+        self.rail_mode.addItems(_RAIL_MODE_LABELS)
+        self.rail_mode.setToolTip(
+            "Fixed mount: the actuator never moves during a job — it is just an "
+            "adjustable mount position.\n"
+            "Index per layer: one actuator move per pallet layer. The pick has to "
+            "stay reachable from the same position (the usual lift-column cell).\n"
+            "Index per pick & place: the actuator also moves between the pick and "
+            "the place, so each can have its own best position — most capable, "
+            "two extra actuator moves per box.")
+        lay.addWidget(self.rail_mode, 2, 2, 1, 2)
+
+        trav_lbl = QLabel("Travel min / max (mm)")
+        trav_lbl.setToolTip("The physical stroke of the actuator, measured along "
+                            "the axis from the mount point (position 0).")
+        lay.addWidget(trav_lbl, 3, 0)
+        self.rail_min = _spin(-3000, 6000, 0)
+        self.rail_max = _spin(-3000, 6000, 1000)
+        lay.addWidget(self.rail_min, 3, 1)
+        lay.addWidget(self.rail_max, 3, 2)
+
+        pos_lbl = QLabel("Position (mm)")
+        pos_lbl.setToolTip("Where the carriage stands right now. Drag it to see "
+                           "the robot ride the actuator in the 3D view.")
+        lay.addWidget(pos_lbl, 4, 0)
+        self.rail_pos = _spin(-3000, 6000, 0)
+        lay.addWidget(self.rail_pos, 4, 1)
+        lay.addWidget(QLabel("Speed (m/s)"), 4, 2)
+        self.rail_speed = _spin(0.01, 5.0, 0.30, dec=2, step=0.05)
+        self.rail_speed.setToolTip("Actuator speed — used for the cycle-time "
+                                   "estimate, not for the arm's own moves.")
+        lay.addWidget(self.rail_speed, 4, 3)
+
+        side_lbl = QLabel("Column side (°)")
+        side_lbl.setToolTip("Which way a vertical column stands from the robot "
+                            "(180° = directly behind). The column is a solid the "
+                            "arm must not swing into, so keep it away from the "
+                            "pick and the pallet — Recommend travel sets this "
+                            "automatically.")
+        lay.addWidget(side_lbl, 5, 0)
+        self.rail_side = _spin(-180, 180, 180, dec=0, step=15)
+        lay.addWidget(self.rail_side, 5, 1)
+        self.rail_collide = QCheckBox("Structure collides")
+        self.rail_collide.setChecked(True)
+        self.rail_collide.setToolTip("Treat the column/beam as a real obstacle the "
+                                     "arm must avoid. Leave on — a lift column "
+                                     "genuinely limits how far back the arm can "
+                                     "swing.")
+        lay.addWidget(self.rail_collide, 5, 2, 1, 2)
+
+        io_lbl = QLabel("Drive I/O: AO / full scale / DO / DI")
+        io_lbl.setToolTip("How an exported program commands the actuator: an "
+                          "analog-out position setpoint, a digital-out 'go', and "
+                          "a digital-in 'in position'. Leave at -1 to emit a "
+                          "clearly-marked stub to fill in yourself.")
+        lay.addWidget(io_lbl, 6, 0)
+        self.rail_ao = QSpinBox(); self.rail_ao.setRange(-1, 15); self.rail_ao.setValue(-1)
+        self.rail_scale = _spin(1, 20000, 1000)
+        self.rail_scale.setToolTip("Millimetres represented by a full-scale analog "
+                                   "output.")
+        self.rail_do = QSpinBox(); self.rail_do.setRange(-1, 15); self.rail_do.setValue(-1)
+        self.rail_di = QSpinBox(); self.rail_di.setRange(-1, 15); self.rail_di.setValue(-1)
+        iorow = QHBoxLayout()
+        for w in (self.rail_ao, self.rail_scale, self.rail_do, self.rail_di):
+            iorow.addWidget(w)
+        lay.addLayout(iorow, 6, 1, 1, 3)
+
+        rec = QPushButton("↕ Recommend travel from the selected pallet")
+        rec.setStyleSheet("background:#88c0d0;font-weight:bold;padding:4px")
+        rec.setToolTip("Works out where the carriage has to stand for every layer "
+                       "of the selected pallet — and therefore how much stroke the "
+                       "actuator needs — then applies it.")
+        rec.clicked.connect(self._rail_recommend)
+        lay.addWidget(rec, 7, 0, 1, 4)
+
+        self.rail_lbl = QLabel("Off — the robot is bolted down.")
+        self.rail_lbl.setWordWrap(True)
+        self.rail_lbl.setStyleSheet("font-size:10px")
+        lay.addWidget(self.rail_lbl, 8, 0, 1, 4)
+
+        self._rail_widgets = [
+            self.rail_axis, self.rail_mode, self.rail_min, self.rail_max,
+            self.rail_pos, self.rail_speed, self.rail_side, self.rail_collide,
+            self.rail_ao, self.rail_scale, self.rail_do, self.rail_di, rec,
+        ]
+        self._rail_form_enabled(False)
+        for w in (self.rail_min, self.rail_max, self.rail_pos, self.rail_speed,
+                  self.rail_side, self.rail_scale):
+            w.valueChanged.connect(self._apply_rail)
+        for w in (self.rail_ao, self.rail_do, self.rail_di):
+            w.valueChanged.connect(self._apply_rail)
+        for w in (self.rail_axis, self.rail_mode):
+            w.currentIndexChanged.connect(self._apply_rail)
+        self.rail_collide.toggled.connect(self._apply_rail)
+        return g
+
+    def _rail_form_enabled(self, on: bool) -> None:
+        for w in self._rail_widgets:
+            w.setEnabled(on)
+
+    def _rail_enable_toggled(self, on: bool) -> None:
+        """Fit or remove the actuator. Fitting it anchors position 0 at wherever
+        the robot already stands, so the arm never jumps when it appears."""
+        if self._rail_loading:
+            return
+        self._checkpoint()
+        rail = self.scene.rail
+        if on:
+            rail.anchor_to(self.kin.base_pose())
+            rail.enabled = True
+            # keep the column out of the working arc from the start
+            rail.face_away_from(self._work_points())
+        else:
+            rail.enabled = False
+        self._apply_rail()
+        self.rail_lbl.setText(
+            "Actuator fitted at the robot's current mount point. Set the stroke, "
+            "or click Recommend travel to size it from the selected pallet."
+            if on else "Off — the robot is bolted down.")
+
+    def _work_points(self):
+        """The world points the arm has to serve — the pick station and every
+        pallet — used to stand a lift column clear of the working arc."""
+        pts = [np.asarray(self._job_opts().pick_pose, float)[:3]]
+        pts += [p.T[:3, 3] for p in self.scene.pallets]
+        return pts
+
+    def _apply_rail(self, *_) -> None:
+        """Push the form onto the shared RailSpec and let the scene re-render.
+
+        The robot's base pose follows from ``scene.changed`` in the main window,
+        so moving the Position spin walks the twin along the actuator live.
+        """
+        if self._rail_loading:
+            return
+        rail = self.scene.rail
+        rail.axis = _RAIL_AXES[self.rail_axis.currentIndex()]
+        rail.mode = MODES[self.rail_mode.currentIndex()]
+        lo, hi = self.rail_min.value() / 1000.0, self.rail_max.value() / 1000.0
+        rail.travel_min, rail.travel_max = min(lo, hi), max(lo, hi)
+        rail.position = rail.clamp(self.rail_pos.value() / 1000.0)
+        rail.speed = float(self.rail_speed.value())
+        rail.structure_angle = float(self.rail_side.value())
+        rail.collide = self.rail_collide.isChecked()
+        rail.ao_pin = int(self.rail_ao.value())
+        rail.ao_scale = max(self.rail_scale.value() / 1000.0, 1e-6)
+        rail.do_pin = int(self.rail_do.value())
+        rail.di_pin = int(self.rail_di.value())
+        self.scene.changed.emit()
+        # the clamp may have moved the position — show what actually took effect
+        self._rail_loading = True
+        self.rail_pos.setValue(rail.position * 1000.0)
+        self._rail_loading = False
+
+    def _load_rail_to_form(self) -> None:
+        """Mirror the RailSpec into the form (project load, undo, model change)."""
+        rail = getattr(self.scene, "rail", None)
+        if rail is None:
+            return
+        self._rail_loading = True
+        try:
+            self.rail_on.setChecked(bool(rail.enabled))
+            self.rail_axis.setCurrentIndex(_RAIL_AXES.index(rail.axis)
+                                           if rail.axis in _RAIL_AXES else 0)
+            self.rail_mode.setCurrentIndex(MODES.index(rail.mode)
+                                           if rail.mode in MODES else 1)
+            self.rail_min.setValue(rail.travel_min * 1000.0)
+            self.rail_max.setValue(rail.travel_max * 1000.0)
+            self.rail_pos.setValue(rail.position * 1000.0)
+            self.rail_speed.setValue(rail.speed)
+            self.rail_side.setValue(rail.structure_angle)
+            self.rail_collide.setChecked(bool(rail.collide))
+            self.rail_ao.setValue(int(rail.ao_pin))
+            self.rail_scale.setValue(rail.ao_scale * 1000.0)
+            self.rail_do.setValue(int(rail.do_pin))
+            self.rail_di.setValue(int(rail.di_pin))
+        finally:
+            self._rail_loading = False
+        self._rail_form_enabled(bool(rail.enabled))
+
+    def _rail_recommend(self) -> None:
+        """Size the stroke from the stack: where must the carriage stand for
+        each layer, and how far does it therefore have to travel?"""
+        i, spec = self._current_spec()
+        if spec is None:
+            self.rail_lbl.setText("Add a pallet first — the recommendation is "
+                                  "sized from its box size and layer count.")
+            return
+        rail = self.scene.rail
+        if not rail.enabled:
+            self.rail_lbl.setText("Tick 'Robot is mounted on a linear actuator' "
+                                  "first.")
+            return
+        self._checkpoint()
+        rail.face_away_from(self._work_points())        # column clear of the work
+        pick = np.asarray(self._job_opts().pick_pose, float)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rec = recommend_rail(self.kin, rail, spec, pick_pose=pick)
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        lines = [rec.message]
+        for lp in rec.layers:
+            mark = "" if lp.feasible else "   ✗ out of reach"
+            lines.append(f"   layer {lp.layer + 1}: carriage at "
+                         f"{lp.position * 1000:.0f} mm (grip plane "
+                         f"{lp.grip_z * 1000:.0f} mm, {lp.utilisation * 100:.0f}% "
+                         f"of reach){mark}")
+        if rec.ok:
+            # apply it: the stroke it asked for, parked at the first layer
+            self._rail_loading = True
+            self.rail_min.setValue(rec.travel_min * 1000.0)
+            self.rail_max.setValue(rec.travel_max * 1000.0)
+            self.rail_side.setValue(rail.structure_angle)
+            self.rail_pos.setValue(rec.layers[0].position * 1000.0)
+            self._rail_loading = False
+            self._apply_rail()
+            grew = "" if rec.within_limits else " (the stroke was extended to fit)"
+            lines.append(f"Applied{grew} — Simulate palletization to run it.")
+        self.rail_lbl.setText("\n".join(lines))
 
     # ---- obstacle actions -------------------------------------------------
     def _add_obstacle(self) -> None:
@@ -663,7 +937,8 @@ class ScenePanel(QWidget):
                       place_approach=self.appr_place.value() / 1000,
                       speed_l=self.job_speed.value(),
                       margin=self.margin.value() / 1000,
-                      smart_posture=self.smart_posture.isChecked())
+                      smart_posture=self.smart_posture.isChecked(),
+                      rail=self.scene.rail)
         return (JobOptions.fast(**common) if self.fast_plan.isChecked()
                 else JobOptions(**common))
 
@@ -825,13 +1100,26 @@ class ScenePanel(QWidget):
                     initial_visible=initial_visible,
                     message="   |   ".join(parts))
 
-    def _cycle_estimate(self, sim, n_boxes: int) -> str:
+    def _cycle_estimate(self, sim, n_boxes: int, steps=None) -> str:
+        """Rough cycle time. The joint path is time-parameterised as usual; any
+        7th-axis moves are added on top from the actuator's own speed/accel,
+        since the arm just waits through those."""
         try:
             from robot.kinematics import TrajectoryPlanner
             if sim is None or len(sim) < 2 or n_boxes <= 0:
                 return ""
             t = float(TrajectoryPlanner(self.kin).time_parameterize(sim)[-1])
-            return f"  ~{t / n_boxes:.1f}s/box, ~{t:.0f}s total (est.)."
+            extra, rail = 0.0, self.scene.rail
+            if steps and rail is not None and rail.enabled:
+                from robot.program import StepType
+                s_prev = rail.position
+                for st in steps:
+                    if st.type is StepType.RAIL_MOVE:
+                        extra += rail.move_time(s_prev, st.rail_pos)
+                        s_prev = st.rail_pos
+            t += extra
+            tail = f" incl. {extra:.0f}s of actuator moves" if extra > 0.5 else ""
+            return f"  ~{t / n_boxes:.1f}s/box, ~{t:.0f}s total (est.{tail})."
         except Exception:                              # noqa: BLE001
             return ""
 
@@ -862,7 +1150,7 @@ class ScenePanel(QWidget):
                  else (f"{n} pallets" if n > 1 else "1 pallet"))
         if res["ok"]:
             tag = f"✓ FEASIBLE ({scope})"
-            extra = self._cycle_estimate(res["sim"], total)
+            extra = self._cycle_estimate(res["sim"], total, res.get("steps"))
         elif total == 0:
             tag = "⚠ CHECK DIMENSIONS"
             extra = ""
@@ -882,6 +1170,13 @@ class ScenePanel(QWidget):
                 "Nothing to add — no boxes fit on the pallet(s). Increase the "
                 "pallet size or reduce the box/gaps.")
             return
+        # tell the generators how to command the actuator, so the exported
+        # program indexes the 7th axis instead of silently assuming it moved
+        rail = self.scene.rail
+        self.program_panel.program.rail_io = (
+            {"name": rail.name, "ao": rail.ao_pin, "ao_scale": rail.ao_scale,
+             "do": rail.do_pin, "di": rail.di_pin}
+            if rail is not None and rail.enabled else {})
         self.program_panel.add_program_steps(res["steps"])
         tag = "feasible ✓" if res["ok"] else "NOT feasible ✗ — review before running"
         self.report_lbl.setText(
@@ -933,6 +1228,7 @@ class ScenePanel(QWidget):
             n = len(self.scene.obstacles) if kind == "obstacle" else len(self.scene.pallets)
             if not (0 <= i < n):
                 self._sel_ref = None
+        self._load_rail_to_form()
         specs = self.scene.render_specs()
         for s in specs:
             if s.get("ref") == self._sel_ref:
@@ -1005,6 +1301,11 @@ class ScenePanel(QWidget):
         self.commit_interaction()          # one undo step for the whole gizmo drag
         kind, _ = ref
         if kind == "robot":
+            # A rail-mounted robot carries its actuator with it: re-anchor the
+            # hardware to the new mount point instead of snapping the arm back.
+            if self.scene.rail is not None and self.scene.rail.enabled:
+                self.scene.rail.anchor_to(self.kin.base_pose())
+                self.scene.changed.emit()
             self._rebuild_axes()
             p = self.kin.base_pose()[:3, 3]
             self.report_lbl.setText(
@@ -1019,11 +1320,14 @@ class ScenePanel(QWidget):
         """A deep copy of everything the user can create/edit on screen."""
         return dict(obstacles=copy.deepcopy(self.scene.obstacles),
                     pallets=copy.deepcopy(self.scene.pallets),
+                    rail=copy.deepcopy(self.scene.rail),
                     base=self.kin.base_pose())
 
     def _restore(self, snap: dict) -> None:
         self.scene.obstacles = copy.deepcopy(snap["obstacles"])
         self.scene.pallets = copy.deepcopy(snap["pallets"])
+        if snap.get("rail") is not None:
+            self.scene.rail = copy.deepcopy(snap["rail"])
         self.kin.set_base_pose(snap["base"])
         self._sel_ref = None
         self.scene.changed.emit()                  # re-render lists + gizmos
@@ -1133,10 +1437,18 @@ class ScenePanel(QWidget):
             self._scene_ctl = None
 
     def _ref_valid(self, ref) -> bool:
+        # Only user-editable items are selectable/draggable. The rail structure
+        # renders with its own ("rail", i) ref so its carriage can be re-posed
+        # during playback, but it is positioned from the panel, never by drag.
         if ref is None:
             return False
         kind, i = ref
-        n = len(self.scene.obstacles) if kind == "obstacle" else len(self.scene.pallets)
+        if kind == "obstacle":
+            n = len(self.scene.obstacles)
+        elif kind == "pallet":
+            n = len(self.scene.pallets)
+        else:
+            return False
         return 0 <= i < n
 
     def _ref_name(self, ref) -> str:

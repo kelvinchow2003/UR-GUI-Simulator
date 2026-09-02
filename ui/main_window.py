@@ -31,7 +31,7 @@ import os
 import sys
 
 import numpy as np
-from PySide6.QtCore import Qt, QTimer, QProcess
+from PySide6.QtCore import Qt, QTimer, QProcess, QFileSystemWatcher
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QDockWidget, QPlainTextEdit, QWidget, QVBoxLayout, QLabel,
@@ -67,6 +67,14 @@ class MainWindow(QMainWindow):
         self.scene = SceneModel(self)
         self._coll_radii = None
         self._project_path: str | None = None      # current .urgproj file, if any
+        # Live reload: watch the open project file so external writes (e.g. from
+        # the MCP server driven by Claude Desktop) refresh the app automatically.
+        self._fs_watcher: QFileSystemWatcher | None = None
+        self._saving = False                        # ignore our own writes
+        self._reload_pending: str | None = None
+        self._reload_timer = QTimer(self)           # debounce rapid changes
+        self._reload_timer.setSingleShot(True)
+        self._reload_timer.timeout.connect(self._do_reload)
 
         self.setWindowTitle("UR GUI Simulator")
         self.resize(1500, 950)
@@ -99,6 +107,8 @@ class MainWindow(QMainWindow):
         self._sim_speed = 1.0          # playback speed multiplier (user-set)
         self._carried_local = None
         self._carried_half = None
+        self._rail_pos = None          # 7th-axis position on the timeline
+        self._carriage_drawn = None    # where the carriage actor is drawn
         self._render_timer = QTimer(self)
         self._render_timer.timeout.connect(self._render_tick)
         self._render_timer.start(33)      # ~30 fps
@@ -275,22 +285,69 @@ class MainWindow(QMainWindow):
         self._set_status("New project.")
 
     def _open_project(self) -> None:
-        from PySide6.QtWidgets import QFileDialog, QMessageBox
-        from robot.project import project_from_json, EXTENSION
+        from PySide6.QtWidgets import QFileDialog
+        from robot.project import EXTENSION
         path, _ = QFileDialog.getOpenFileName(
             self, "Open Project", "", f"UR GUI project (*{EXTENSION})")
-        if not path:
-            return
+        if path:
+            self.load_project_file(path, watch=True)
+
+    def load_project_file(self, path: str, watch: bool = False) -> bool:
+        """Open a project file and apply it. When ``watch`` is set, keep watching
+        the file and live-reload it on external changes (the MCP live-edit flow)."""
+        from PySide6.QtWidgets import QMessageBox
+        from robot.project import project_from_json
         try:
             with open(path, encoding="utf-8") as fh:
                 data = project_from_json(fh.read())
             self._apply_project(data)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Open Project", f"Could not open:\n{exc}")
-            return
+            return False
         self._project_path = path
         self._update_title()
         self._set_status(f"Opened project {path}")
+        if watch:
+            self._watch_project(path)
+        return True
+
+    # ---- live reload (external edits, e.g. from the MCP server) -----------
+    def _watch_project(self, path: str) -> None:
+        if self._fs_watcher is None:
+            self._fs_watcher = QFileSystemWatcher(self)
+            self._fs_watcher.fileChanged.connect(self._on_project_changed)
+            self._fs_watcher.directoryChanged.connect(self._on_project_changed)
+        if self._fs_watcher.files():
+            self._fs_watcher.removePaths(self._fs_watcher.files())
+        if self._fs_watcher.directories():
+            self._fs_watcher.removePaths(self._fs_watcher.directories())
+        self._fs_watcher.addPath(path)
+        # Also watch the directory: an atomic replace (os.replace) swaps the file
+        # out from under a file-only watch, which the directory watch still sees.
+        self._fs_watcher.addPath(os.path.dirname(os.path.abspath(path)))
+        self._set_status(f"Live reload on — watching {os.path.basename(path)}")
+
+    def _on_project_changed(self, _changed: str) -> None:
+        if self._saving or not self._project_path:
+            return
+        self._reload_pending = self._project_path
+        self._reload_timer.start(250)               # debounce/coalesce writes
+
+    def _do_reload(self) -> None:
+        from robot.project import project_from_json
+        path = self._reload_pending
+        if not path or not os.path.exists(path):
+            return
+        # Re-add the path: an atomic replace can drop it from the file watcher.
+        if self._fs_watcher and path not in self._fs_watcher.files():
+            self._fs_watcher.addPath(path)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = project_from_json(fh.read())
+        except (OSError, ValueError):
+            return                                  # mid-write; a later event retries
+        self._apply_project(data)
+        self._set_status(f"Live-reloaded {os.path.basename(path)}")
 
     def _save_project(self) -> None:
         if self._project_path is None:
@@ -311,12 +368,15 @@ class MainWindow(QMainWindow):
 
     def _write_project(self, path: str) -> None:
         from PySide6.QtWidgets import QMessageBox
+        self._saving = True                         # suppress our own reload
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(self._gather_project())
         except OSError as exc:
             QMessageBox.warning(self, "Save Project", f"Could not save:\n{exc}")
             return
+        finally:
+            QTimer.singleShot(600, lambda: setattr(self, "_saving", False))
         self._project_path = path
         self._update_title()
         self._set_status(f"Saved project {path}")
@@ -355,17 +415,25 @@ class MainWindow(QMainWindow):
             lambda poses: self._set_status(f"Toolpath ready: {len(poses)} points."))
         # (scene box rendering + selection highlight is owned by scene_panel)
         self.program_panel.set_collision_checker(self._collision_check)
-        # A pedestal under the robot mounts it higher: keep the base height in
-        # sync with the pedestal stack whenever the scene is edited.
+        # The robot stands on whatever the scene says it is mounted on — a
+        # pedestal stack, or the carriage of a linear actuator. Keep the base
+        # pose in sync with that whenever the scene is edited.
         self.scene.changed.connect(self._sync_base_height)
 
     def _sync_base_height(self) -> None:
-        """Lift the robot base to the top of the pedestal stack (0 if none)."""
-        h = self.scene.pedestal_height()
-        if abs(h - getattr(self.kin, "base_height", 0.0)) < 1e-9:
+        """Put the robot base where its mounting hardware holds it.
+
+        With a rail fitted the carriage owns the base pose outright; otherwise
+        the robot keeps its X/Y/rotation and rides the top of the pedestal
+        stack. Either way the twin, the collision capsules and every world pose
+        IK solves against follow, because they all read the same base.
+        """
+        target = self.scene.robot_base_pose(self.kin.base_pose())
+        if np.allclose(target, self.kin.base_pose(), atol=1e-9):
             return                                      # unchanged — no re-render
-        self.kin.set_base_height(h)
-        self.viewport.update_joints(self.viewport._q)   # re-pose the twin, lifted
+        self.kin.set_base_pose(target)
+        self.viewport.update_joints(self.viewport._q)   # re-pose the twin
+        self.scene_panel._rebuild_axes()                # the origin gizmo moved too
 
     def _collision_check(self, q_path):
         """Scene collision hook for offline simulation. Returns (idx, result)."""
@@ -380,7 +448,8 @@ class MainWindow(QMainWindow):
     def _on_model_changed(self, name: str) -> None:
         self.model = get_model(name)
         self.kin.set_model(self.model)
-        self.kin.set_base_height(self.scene.pedestal_height())  # re-apply mount
+        # set_model resets the base, so re-apply the mount (pedestal or rail)
+        self.kin.set_base_pose(self.scene.robot_base_pose(self.kin.base_pose()))
         self.viewport.set_kinematics(self.kin)
         self._coll_radii = None
         self.scene_panel._radii = None
@@ -448,6 +517,7 @@ class MainWindow(QMainWindow):
         self._anim_stride = self._playback_stride(len(self._anim_path))
         self._carried_local = None
         self._carried_half = None
+        self._rail_pos = None
         self.viewport.set_carried_box(None)
 
     def play_job(self, q_path: np.ndarray, events: dict,
@@ -462,11 +532,32 @@ class MainWindow(QMainWindow):
         self._anim_stride = self._playback_stride(len(self._anim_path))
         self._carried_local = None
         self._carried_half = None
+        self._rail_pos = None
         self.viewport.set_carried_box(None)
         if initial_visible is None:
             self.viewport.set_placed_visible(0)
         else:
             self.viewport.set_boxes_visible(initial_visible)
+
+    def _draw_carriage(self, force: bool = False) -> None:
+        """Slide the rail's carriage actor to wherever the 7th axis now is.
+
+        Called once per rendered frame rather than once per timeline event, so a
+        long actuator move costs one actor re-pose per frame, not per sample.
+        """
+        rail = getattr(self.scene, "rail", None)
+        if rail is None or not (rail.enabled and rail.show_structure):
+            return
+        if force:
+            self._rail_pos = float(rail.position)
+        s = self._rail_pos
+        if s is None:
+            return
+        if (not force and self._carriage_drawn is not None
+                and abs(s - self._carriage_drawn) < 1e-9):
+            return
+        self._carriage_drawn = s
+        self.viewport.update_scene_actor(("rail", 1), rail.carriage_box(s).T)
 
     def _apply_anim_event(self, i: int) -> None:
         ev = self._anim_events.get(i)
@@ -485,6 +576,11 @@ class MainWindow(QMainWindow):
             self.viewport.set_box_visible(int(ev[1]), True)
         elif ev[0] == "box_hide":               # source box just picked up
             self.viewport.set_box_visible(int(ev[1]), False)
+        elif ev[0] == "rail":                   # 7th axis indexed to a new spot
+            # The whole robot moves: re-pose the base the twin, the carried box
+            # and the collision capsules are all computed from.
+            self.kin.set_base_pose(np.asarray(ev[2], float))
+            self._rail_pos = float(ev[1])
 
     def _render_tick(self) -> None:
         # While the user is hand-guiding a joint in the 3D view, the drag
@@ -500,6 +596,7 @@ class MainWindow(QMainWindow):
                 self._apply_anim_event(j)
             k = min(i + stride - 1, n - 1)
             q = self._anim_path[k]
+            self._draw_carriage()               # follow the 7th axis, if it moved
             self.viewport.update_joints(q)
             if self._carried_local is not None:
                 T = self.kin.fk_frames(np.asarray(q, float))[-1] @ self._carried_local
@@ -510,6 +607,10 @@ class MainWindow(QMainWindow):
                 self._anim_events = {}
                 self._carried_local = None
                 self.viewport.set_carried_box(None)
+                # the job parked the robot wherever its last move left it — put
+                # it back on the mount the scene actually describes
+                self._sync_base_height()
+                self._draw_carriage(force=True)
                 self._set_status("Simulation complete.")
             return
         # live: follow latest cached joint state — but only actually re-pose

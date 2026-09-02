@@ -17,6 +17,18 @@ palletizing **job planner** that:
 Frames & conventions match the rest of the app: base-frame metres, TCP
 pose ``[x,y,z,rx,ry,rz]`` (axis-angle). The tool approaches every pick and
 place pointing straight **down** (tool +Z = world −Z).
+
+Seventh axis
+------------
+When :attr:`JobOptions.rail` carries an enabled :class:`robot.rail.RailSpec`
+the robot is mounted on a linear actuator, and the job **indexes it**: the
+rail moves to a position chosen for each layer (or for each pick and place
+in ``per_move`` mode), the arm works from there, and the whole cycle repeats
+one notch along. Because the rail simply re-poses the robot base, the same
+IK, collision and playback code covers it — the planner just sets the base
+before solving, and emits the actuator move as a
+:data:`robot.program.StepType.RAIL_MOVE` step plus ``("rail", s, T)`` events
+on the animation timeline.
 ==================================================================
 """
 from __future__ import annotations
@@ -32,6 +44,7 @@ from robot.kinematics import (
 from robot.collision import Box, CollisionWorld
 from robot.posture import PostureOptimizer, PostureWeights
 from robot.program import ProgramStep, StepType
+from robot.rail import RailSpec, _utilisation, layer_positions_for_job
 
 # tool pointing straight down: tool +Z = world −Z (180° about X)
 _R_DOWN = np.array([[1.0, 0.0, 0.0],
@@ -308,6 +321,12 @@ class JobOptions:
     # base variants) and pick the one that clears the world, instead of taking
     # whatever branch the seed happened to land on. Off ⇒ legacy seed-loop.
     smart_posture: bool = True
+    # The linear actuator the robot is mounted on (None / disabled ⇒ the robot
+    # is bolted down and the base never moves). When enabled, the job indexes
+    # it per layer — or per pick and place in ``per_move`` mode — so a stack
+    # taller than the arm's working envelope is still buildable.
+    rail: Optional[RailSpec] = None
+    rail_steps: int = 8             # playback samples per actuator move
 
     @classmethod
     def fast(cls, **kw) -> "JobOptions":
@@ -363,6 +382,127 @@ class PalletJob:
             kin, PostureWeights(clearance=12.0, clearance_cap=0.08,
                                 singularity=1.0, limit=1.0,
                                 elbow_up=3.0, continuity=2.0))
+        # --- 7th axis ---------------------------------------------------
+        rail = getattr(self.opts, "rail", None)
+        self.rail: Optional[RailSpec] = rail if (rail is not None and rail.enabled) else None
+        self.rail_mode = self.rail.mode if self.rail is not None else "fixed"
+        # base pose the caller handed us — restored when planning finishes, so
+        # a job never leaves the shared Kinematics parked somewhere unexpected.
+        self._base_home = kin.base_pose()
+        self._rail_start = float(self.rail.position) if self.rail is not None else 0.0
+        self._rail_now = self._rail_start
+        self._rail_layer: Dict[int, float] = {}      # layer → rail position
+        self._rail_pick = self._rail_start           # per_move pick station
+        # Where the carriage stands on the timeline built so far. Boxes are
+        # planned in order, so the next one starts from wherever the last one
+        # left it — that is what makes "index up one layer" a single move.
+        self._rail_cursor = self._rail_start
+        self._pick_cache: Dict[float, tuple] = {}    # rail position → pick IK
+        self._rail_seen: List[float] = [self._rail_start]  # positions commanded
+
+    # ---- 7th axis ---------------------------------------------------------
+    def _rail_set(self, s: float) -> None:
+        """Park the (shared) kinematics on the carriage at position ``s`` so
+        every FK/IK/collision query below is answered for a robot standing
+        there. No-op without a rail."""
+        if self.rail is None:
+            return
+        self._rail_now = float(s)
+        self.kin.set_base_pose(self.rail.base_pose_at(s))
+
+    def _rail_restore(self) -> None:
+        self.kin.set_base_pose(self._base_home)
+        self._rail_now = self._rail_start
+
+    def _rail_for_layer(self, layer: int) -> float:
+        """Where the carriage stands while this layer is built."""
+        if self.rail is None or self.rail_mode == "fixed":
+            return self._rail_start
+        return self._rail_layer.get(int(layer), self._rail_start)
+
+    def _rail_for_place(self, place: BoxPlacement) -> float:
+        """Where the carriage stands to set THIS box down.
+
+        In ``per_layer`` mode that is the whole layer's position. In
+        ``per_move`` mode each set-down gets its own — which is what makes a
+        horizontal track worth having: a pallet longer than the arm's reach is
+        served by driving along it box by box, instead of demanding one spot
+        cover the whole row.
+        """
+        if self.rail is None or self.rail_mode != "per_move":
+            return self._rail_for_layer(place.layer)
+        return self._rail_for_point(self._place_pose(place)[:3])
+
+    def _plan_rail(self, pick_pose) -> None:
+        """Choose the carriage position for every layer (and, in ``per_move``
+        mode, for the pick station) before any motion is planned.
+
+        Positions are picked by :func:`robot.rail.layer_positions_for_job`,
+        which sizes each layer against the arm's usable reach band and clamps
+        the answer to the stroke the actuator actually has — so a job always
+        plans against the real hardware, and an out-of-reach layer surfaces as
+        an honest reachability failure rather than an impossible rail command.
+        """
+        if self.rail is None or self.rail_mode == "fixed":
+            self._rail_layer = {}
+            self._rail_pick = self._rail_start
+            return
+        if self.rail_mode == "per_move":
+            # every move picks its own spot at plan time, so there is no layer
+            # table to precompute — only the fixed pick station.
+            self._rail_layer = {}
+            self._rail_pick = self._rail_for_point(pick_pose)
+            return
+        self._rail_layer = layer_positions_for_job(
+            self.kin, self.rail, self.spec, pick_pose=pick_pose)
+        self._rail_pick = self._rail_start
+
+    def _rail_pick_station(self, layer: int = 0) -> float:
+        """Carriage position the box is picked from. In ``per_move`` mode the
+        pick has its own spot; otherwise the whole cycle runs from the layer's
+        position, because the rail does not move mid-cycle."""
+        if self.rail is None:
+            return self._rail_start
+        if self.rail_mode == "per_move":
+            return self._rail_pick
+        return self._rail_for_layer(layer)
+
+    def _solve_pick(self, pick, pick_clear, world_ext: CollisionWorld,
+                    s: float) -> tuple:
+        """Pick-side IK at carriage position ``s``, memoised.
+
+        The pick pose is identical for every box, so it only has to be solved
+        once *per rail position* — which is once for a bolted-down robot, and
+        once per indexed layer when the actuator carries the arm to a new spot.
+        """
+        key = round(float(s), 6)
+        cached = self._pick_cache.get(key)
+        if cached is not None:
+            return cached
+        self._rail_set(s)
+        res_pc = self._solve_best(pick_clear, self.q_start, world=world_ext)
+        res_pk = self._solve_best(pick, res_pc.q, world=world_ext)
+        out = (res_pc.q, res_pk.q, bool(res_pc.success and res_pk.success))
+        self._pick_cache[key] = out
+        return out
+
+    def _rail_for_point(self, point) -> float:
+        """Least-stretched carriage position (inside the stroke) for reaching a
+        single world point — used to give the pick station its own position in
+        ``per_move`` mode, where the rail indexes mid-cycle."""
+        if self.rail is None or self.rail_mode != "per_move":
+            return self._rail_start
+        reach = float(getattr(self.kin.model, "reach_mm", 1300.0)) / 1000.0
+        p = np.asarray(point, float)[:3].reshape(1, 3)
+        best, best_score = self._rail_start, None
+        for s in np.linspace(self.rail.travel_min, self.rail.travel_max, 21):
+            cost, u, ok = _utilisation(p, self.rail.base_origin_at(float(s)),
+                                       reach)
+            if not ok:
+                continue
+            if best_score is None or (cost, u) < best_score:
+                best_score, best = (cost, u), float(s)
+        return best
 
     # ---- carried-box geometry (in the TCP frame) -------------------------
     def _carried_local(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -414,15 +554,20 @@ class PalletJob:
         any static solid the tool must traverse over — e.g. boxes already stacked
         on another pallet in a multi-pallet run. Routing the high traverse above
         those keeps the carried box from sweeping through them; a genuine clip is
-        still caught by the collision check and reported."""
+        still caught by the collision check and reported.
+
+        The robot's own mounting hardware is excluded: a pedestal sits under the
+        base and a rail column stands beside it, so neither is something the tool
+        ever flies a box over. Counting a 1.3 m lift column here would demand a
+        transfer height above the arm's own reach and fail every job."""
         s = self.spec
         stack_top = (float(s.T[2, 3]) + float(s.size[2])
                      + s.layers * float(s.box_size[2])
                      + max(s.layers - 1, 0) * s.layer_gap)
         pick_z = float(np.asarray(self.opts.pick_pose, float)[2])
         carry_h = float(s.box_size[2])                 # box hangs below the TCP
-        static_top = max((float(b.T[2, 3] + b.half[2]) for b in self.static),
-                         default=0.0)
+        static_top = max((float(b.T[2, 3] + b.half[2]) for b in self.static
+                          if b.kind not in ("rail", "pedestal")), default=0.0)
         return max(stack_top, pick_z, static_top + carry_h) + self.opts.place_approach
 
     def _solve_best(self, pose, seed, world: Optional[CollisionWorld] = None,
@@ -477,6 +622,35 @@ class PalletJob:
             if min_z > 0.05:            # already a cleanly elbow-up solution
                 break
         return best
+
+    def _check_sample(self, q, carried_box: Optional[Box],
+                      world_ext: CollisionWorld, slab_world: CollisionWorld,
+                      stack_world: Optional[CollisionWorld]):
+        """Every collision test one trajectory sample has to pass, in order of
+        how hard they are to argue with. Answered for wherever the base is
+        parked right now, so it is equally valid mid-rail-move.
+
+        * external solids (guarding, pedestals, the rail column, other pallets)
+          get the full user safety margin, and are the only ones the carried box
+          is tested against;
+        * work surfaces (this pallet's slab, conveyors) and the stack being
+          built are approached on purpose, so they are checked arm-only with a
+          penetration tolerance — a grazing wrist is fine, a link ploughing
+          through is not.
+        """
+        o = self.opts
+        res = world_ext.check(self.kin, q, margin=o.margin, carried=carried_box,
+                              carried_obstacles=world_ext.boxes)
+        if res.hit:
+            return res
+        res = slab_world.check(self.kin, q, margin=-o.surface_tol)
+        if res.hit:
+            return res
+        if stack_world is not None:
+            res = stack_world.check(self.kin, q, margin=-o.surface_tol)
+            if res.hit:
+                return res
+        return None
 
     def _carried_stack_overlap(self, q, carried_box: Box, placed: List[Box]):
         """Return a CollisionResult if the carried box *overlaps* (penetrates)
@@ -557,20 +731,27 @@ class PalletJob:
                   via_apex: bool = False,
                   pick_pose: Optional[np.ndarray] = None,
                   reveal_event: Optional[tuple] = None,
-                  pick_event: Optional[tuple] = None) -> dict:
+                  pick_event: Optional[tuple] = None,
+                  rail_pick: Optional[float] = None) -> dict:
         """Plan ONE box's pick→place with a given avoidance strategy, build its
         local sample buffer, and collision-check it. The caller tries a schedule
         of strategies (higher clearance, side approach, mid-traverse apex) and
         commits the first collision-free result into the global timeline.
 
-        Each leg is ``(move_type, pose, carrying, name, grip, event)`` so the
-        route length can vary (an apex via-point adds a leg) while step export
-        and timeline events stay index-independent. Returns a dict with the local
+        Each leg is ``(move_type, pose, carrying, name, grip, event, rail)`` so
+        the route length can vary (an apex via-point adds a leg) while step
+        export and timeline events stay index-independent. ``rail`` is the 7th
+        axis position that leg is performed at; where it changes between legs
+        the planner inserts an actuator transit (arm held still, base sliding)
+        and checks that motion for collisions too. Returns a dict with the local
         samples/events, the export legs+qs, reachability, and the first collision
         (if any) as ``(result, local_sample_offset, leg_index)``.
         """
         o = self.opts
         stride = max(1, int(o.coll_stride))
+        s_place = self._rail_for_place(place)
+        s_pick = s_place if rail_pick is None else float(rail_pick)
+        self._rail_set(s_place)
         pick = np.asarray(o.pick_pose if pick_pose is None else pick_pose, float)
         pick_clear = self._at_height(pick, self._clearance_height())
 
@@ -602,14 +783,14 @@ class PalletJob:
         q_place = res_pl.q
         reachable = res_plc.success and res_pl.success
 
-        # legs: (move_type, pose, carrying, name, grip_after, event)
+        # legs: (move_type, pose, carrying, name, grip_after, event, rail)
         legs = [
-            ("J", pick_clear, False, "pick approach", "", ""),
-            ("L", pick, False, "pick", "close", ""),
-            ("L", pick_clear, True, "lift", "", "carry"),
-            ("J", approach_hi, True, "place approach", "", ""),
-            ("L", place_pose, True, "place", "open", ""),
-            ("L", approach_hi, False, "retract", "", "drop_reveal"),
+            ("J", pick_clear, False, "pick approach", "", "", s_pick),
+            ("L", pick, False, "pick", "close", "", s_pick),
+            ("L", pick_clear, True, "lift", "", "carry", s_pick),
+            ("J", approach_hi, True, "place approach", "", "", s_place),
+            ("L", place_pose, True, "place", "open", "", s_place),
+            ("L", approach_hi, False, "retract", "", "drop_reveal", s_place),
         ]
         qs = [q_pick_clear, q_pick, q_pick_clear, q_place_clear, q_place, q_place_clear]
 
@@ -628,7 +809,7 @@ class PalletJob:
             apex[2] = max(float(pick_clear[2]), float(approach_hi[2])) + 0.08
             res_apex = self._solve_best(apex, q_place_clear, world=avoid)
             if res_apex.success:
-                legs.insert(3, ("J", apex, True, "traverse apex", "", ""))
+                legs.insert(3, ("J", apex, True, "traverse apex", "", "", s_place))
                 qs.insert(3, res_apex.q)
 
         # The current pallet's own already-placed boxes are a solid the ARM must
@@ -641,35 +822,46 @@ class PalletJob:
         lsim: List[np.ndarray] = []
         levents: Dict[int, tuple] = {}
         leg_hit = None
+        rail_from = self._rail_cursor          # where the carriage already is
+        s_cur = rail_from
         for li, leg in enumerate(legs):
-            _, _, carrying, _, _, event = leg
+            _, _, carrying, _, _, event, s_leg = leg
             q0 = q_prev if li == 0 else qs[li - 1]
             q1 = qs[li]
-            seg = self.planner.joint_move(q0, q1, o.sim_steps)
             carried_box = Box(half=carry_half, T=local_carry, name=f"box{k}") \
                 if carrying else None
+
+            # --- actuator transit: the arm holds its pose while the base
+            #     slides along the rail. The tool still sweeps through the cell,
+            #     so every sample is collision-checked exactly like a joint move.
+            if self.rail is not None and abs(s_leg - s_cur) > 1e-6:
+                n_r = max(2, int(getattr(o, "rail_steps", 8)))
+                off = len(lsim)
+                q_hold = np.asarray(q0, float)
+                fracs = np.linspace(0.0, 1.0, n_r + 1)[1:]
+                for j, t in enumerate(fracs):
+                    s = s_cur + (s_leg - s_cur) * float(t)
+                    lsim.append(q_hold.tolist())
+                    levents[off + j] = ("rail", float(s), self.rail.base_pose_at(s))
+                    if leg_hit is None and (j % stride == 0 or j == len(fracs) - 1):
+                        self._rail_set(s)
+                        res = self._check_sample(q_hold, carried_box, world_ext,
+                                                 slab_world, stack_world)
+                        if res is not None:
+                            leg_hit = (res, off + j, li)
+                s_cur = s_leg
+            self._rail_set(s_cur)
+
+            seg = self.planner.joint_move(q0, q1, o.sim_steps)
             base_off = len(lsim)
             lsim.extend(seg[1:].tolist())
             if leg_hit is None:
                 for j in range(1, len(seg), stride):
-                    res = world_ext.check(self.kin, seg[j], margin=o.margin,
-                                          carried=carried_box,
-                                          carried_obstacles=world_ext.boxes)
-                    if res.hit:
+                    res = self._check_sample(seg[j], carried_box, world_ext,
+                                             slab_world, stack_world)
+                    if res is not None:
                         leg_hit = (res, base_off + j - 1, li)
                         break
-                    res_s = slab_world.check(self.kin, seg[j],
-                                             margin=-o.surface_tol)
-                    if res_s.hit:
-                        leg_hit = (res_s, base_off + j - 1, li)
-                        break
-                    # arm links vs the stack being built (tool grazing tolerated)
-                    if stack_world is not None:
-                        res_st = stack_world.check(self.kin, seg[j],
-                                                   margin=-o.surface_tol)
-                        if res_st.hit:
-                            leg_hit = (res_st, base_off + j - 1, li)
-                            break
                 # carried box vs the already-placed stack — checked only at the
                 # settled set-down leg so it stays O(boxes), not O(boxes²·samples).
                 if (leg_hit is None and leg[3] == "place"
@@ -685,10 +877,24 @@ class PalletJob:
                 levents[base_off] = (reveal_event if reveal_event is not None
                                      else ("drop_reveal", k + 1))
         return {"reachable": reachable, "leg_hit": leg_hit, "lsim": lsim,
-                "levents": levents, "legs": legs, "qs": qs}
+                "levents": levents, "legs": legs, "qs": qs,
+                "rail_from": rail_from, "rail_to": s_cur}
 
     # ---- the plan ---------------------------------------------------------
     def plan(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
+        """Plan the job.
+
+        Planning walks the (shared) :class:`~robot.kinematics.Kinematics` up and
+        down the rail to answer FK/IK/collision at each carriage position, so it
+        always hands the base pose back exactly as it found it — however the
+        plan ends.
+        """
+        try:
+            return self._plan_impl()
+        finally:
+            self._rail_restore()
+
+    def _plan_impl(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
         placements = generate_placements(self.spec)
         report = PalletReport(ok=True)
         # Nothing fits — usually the box is bigger than the pallet (or gaps too
@@ -738,20 +944,25 @@ class PalletJob:
         slab_world = CollisionWorld([pallet_slab] + surfaces, self.radii)
         placed: List[Box] = []
 
-        # --- pick side is IDENTICAL for every box, so solve it ONCE ----------
-        # (its poses don't depend on k). This alone removes ~half of all IK
-        # solves, the dominant planning cost. Posture is chosen to clear the
-        # external solids (the pick approaches over an empty area, away from the
-        # pallet stack, so the slab isn't an obstacle here).
-        res_pc = self._solve_best(pick_clear, self.q_start, world=world_ext)
-        q_pick_clear = res_pc.q
-        res_pk = self._solve_best(pick, q_pick_clear, world=world_ext)
-        q_pick = res_pk.q
-        pick_reachable = res_pc.success and res_pk.success
+        # --- 7th axis: decide where the carriage stands for each layer -------
+        # (and, in per_move mode, for the pick station). Done before any IK so
+        # every solve below already happens at the right mount position.
+        self._plan_rail(pick)
 
+        # --- pick side is IDENTICAL for every box, so solve it ONCE ----------
+        # (its poses don't depend on k) — once per carriage position when a rail
+        # indexes the robot, which _solve_pick memoises. This alone removes
+        # ~half of all IK solves, the dominant planning cost. Posture is chosen
+        # to clear the external solids (the pick approaches over an empty area,
+        # away from the pallet stack, so the slab isn't an obstacle here).
         for k, place in enumerate(placements):
             st = BoxStatus(index=k, layer=place.layer)
             q_prev = sim[-1]                 # config the arm arrives in
+            # rail position for this box: its layer's, and the pick station's
+            # (identical unless the actuator indexes mid-cycle).
+            s_pick = self._rail_pick_station(place.layer)
+            q_pick_clear, q_pick, pick_reachable = self._solve_pick(
+                pick, pick_clear, world_ext, s_pick)
 
             # Collision-aware planning: instead of committing one fixed motion and
             # merely *reporting* a crash, try a schedule of avoidance strategies —
@@ -781,7 +992,8 @@ class PalletJob:
             for params in strategies:
                 best = self._plan_box(k, place, q_prev, placed,
                                       q_pick_clear, q_pick, world_ext, slab_world,
-                                      local_carry, carry_half, **params)
+                                      local_carry, carry_half,
+                                      rail_pick=s_pick, **params)
                 if not (pick_reachable and best["reachable"]):
                     break               # unreachable target — re-routing won't help
                 if best["leg_hit"] is None:
@@ -793,7 +1005,9 @@ class PalletJob:
             sim.extend(best["lsim"])
             for off, ev in best["levents"].items():
                 events[base + off] = ev
-            self._emit_steps(steps, best["legs"], best["qs"])
+            self._emit_steps(steps, best["legs"], best["qs"],
+                             rail_from=best["rail_from"])
+            self._rail_cursor = best["rail_to"]
 
             st.reachable = pick_reachable and best["reachable"]
             leg_hit = best["leg_hit"]
@@ -815,7 +1029,8 @@ class PalletJob:
         if report.ok:
             report.message = (
                 f"All {len(placements)} boxes reachable and collision-free "
-                f"({self.spec.layers} layers, {self.spec.pattern} pattern).")
+                f"({self.spec.layers} layers, {self.spec.pattern} pattern)"
+                f"{self._rail_summary()}.")
         # Payload overrides geometry: a reachable path you can't lift isn't runnable.
         if not payload_ok:
             report.ok = False
@@ -823,9 +1038,27 @@ class PalletJob:
                               else payload_msg + "  Also: " + report.message)
         return steps, np.asarray(sim, float), events, report
 
+    def _rail_summary(self) -> str:
+        """How far the actuator actually had to travel over the whole job."""
+        if self.rail is None or len(self._rail_seen) < 2:
+            return ""
+        vals = list(self._rail_seen)
+        lo, hi = min(vals) * 1000.0, max(vals) * 1000.0
+        return (f", {self.rail.name} indexing {lo:.0f}→{hi:.0f} mm "
+                f"({hi - lo:.0f} mm used of {self.rail.travel() * 1000:.0f} mm stroke)")
+
     def _failure_message(self, k: int, place: "BoxPlacement", st: "BoxStatus") -> str:
         """A plain-language, actionable reason the palletization stopped."""
         where = f"Box {k + 1} (layer {place.layer + 1})"
+        rail_txt = ""
+        if self.rail is not None:
+            s = self._rail_for_place(place)      # the position THIS box used
+            at_limit = (abs(s - self.rail.travel_min) < 1e-6
+                        or abs(s - self.rail.travel_max) < 1e-6)
+            rail_txt = f" with {self.rail.name} at {s * 1000:.0f} mm"
+            if at_limit:
+                rail_txt += (" — the end of its stroke, so give the actuator more "
+                             "travel (or run Recommend travel) and try again")
         if not st.reachable:
             dist_mm = float(np.linalg.norm(place.T[:2, 3])) * 1000.0
             try:
@@ -834,18 +1067,32 @@ class PalletJob:
                 reach_mm = 0.0
             reach_txt = (f" — it sits ~{dist_mm:.0f} mm from the base "
                          f"(arm reach {reach_mm:.0f} mm)") if reach_mm else ""
-            return (f"{where} is unreachable{reach_txt}. Move the pallet closer to "
-                    f"the base (lower Pallet pos X), shrink the pallet, or reposition it.")
-        return (f"{where} collides — {st.detail}. Move the pallet/obstacle, raise the "
-                f"approach height, or reduce the safety margin.")
+            return (f"{where} is unreachable{rail_txt}{reach_txt}. Move the pallet "
+                    f"closer to the base (lower Pallet pos X), shrink the pallet, "
+                    f"or reposition it.")
+        return (f"{where} collides{rail_txt} — {st.detail}. Move the pallet/obstacle, "
+                f"raise the approach height, or reduce the safety margin.")
 
     # ---- URScript steps ---------------------------------------------------
-    def _emit_steps(self, steps: List[ProgramStep], legs, qs) -> None:
+    def _emit_steps(self, steps: List[ProgramStep], legs, qs,
+                    rail_from: Optional[float] = None) -> None:
         """Emit exportable program steps for one box's route. Iterates the leg
         metadata so a variable-length route (e.g. one with a traverse-apex via)
-        exports correctly and the gripper open/close land on the right legs."""
+        exports correctly and the gripper open/close land on the right legs.
+
+        A leg performed at a different 7th-axis position than the one before it
+        is preceded by a ``RAIL_MOVE`` step, so the exported program indexes the
+        actuator in exactly the places the simulation did."""
         o = self.opts
-        for (mt, pose, _carry, name, grip, _event), q in zip(legs, qs):
+        s_cur = self._rail_cursor if rail_from is None else float(rail_from)
+        for (mt, pose, _carry, name, grip, _event, s_leg), q in zip(legs, qs):
+            if self.rail is not None and abs(float(s_leg) - s_cur) > 1e-6:
+                steps.append(ProgramStep(
+                    StepType.RAIL_MOVE,
+                    name=f"{self.rail.name} → {float(s_leg) * 1000:.0f} mm",
+                    rail_pos=float(s_leg)))
+                s_cur = float(s_leg)
+                self._rail_seen.append(s_cur)
             if mt == "J":
                 steps.append(ProgramStep(StepType.MOVEJ, name=name,
                                          q=list(map(float, q)),
@@ -887,7 +1134,7 @@ class TransferJob(PalletJob):
         self.base_src = int(base_src)
         self.base_dst = int(base_dst)
 
-    def plan(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
+    def _plan_impl(self) -> Tuple[List[ProgramStep], np.ndarray, Dict[int, tuple], PalletReport]:
         src_pls = generate_placements(self.source_spec)
         dst_pls = generate_placements(self.spec)
         report = PalletReport(ok=True)
@@ -910,10 +1157,23 @@ class TransferJob(PalletJob):
         base_surfaces = [b for b in self.static if b.kind == "conveyor"]
         placed_dst: List[Box] = []
 
+        # 7th axis: index the carriage per *destination* layer, exactly as a
+        # plain palletize does. The pick side moves too (the source stack gets
+        # shorter box by box), so in per_move mode each pick gets its own
+        # position — computed per box rather than once.
+        self._plan_rail(self._grip_pose(src_pls[-1], src_grip))
+
         for i in range(count):
             src_box = src_pls[n_src - 1 - i]           # depalletize top-first
             dst_place = dst_pls[i]                      # palletize in stacking order
             pick_pose = self._grip_pose(src_box, src_grip)
+            # per_move gives the pick its own position (the source stack gets
+            # shorter box by box); otherwise the whole cycle runs from the
+            # destination layer's position, the same as a plain palletize.
+            s_pick = (self._rail_for_point(pick_pose)
+                      if self.rail_mode == "per_move"
+                      else self._rail_for_place(dst_place))
+            self._rail_set(s_pick)                      # solve the pick from there
 
             # Remaining source boxes (below/around the one being picked) are a
             # work surface the tool descends into to grip the top box: checked
@@ -954,7 +1214,7 @@ class TransferJob(PalletJob):
                 best = self._plan_box(
                     i, dst_place, sim[-1], placed_dst, q_pick_clear, q_pick,
                     world_ext, slab_world, local_carry, carry_half,
-                    pick_pose=pick_pose,
+                    pick_pose=pick_pose, rail_pick=s_pick,
                     reveal_event=("box_show", dst_g),
                     pick_event=("box_hide", src_g), **params)
                 if not (pick_reachable and best["reachable"]):
@@ -966,7 +1226,9 @@ class TransferJob(PalletJob):
             sim.extend(best["lsim"])
             for off, ev in best["levents"].items():
                 events[base + off] = ev
-            self._emit_steps(steps, best["legs"], best["qs"])
+            self._emit_steps(steps, best["legs"], best["qs"],
+                             rail_from=best["rail_from"])
+            self._rail_cursor = best["rail_to"]
 
             st = BoxStatus(index=i, layer=dst_place.layer)
             st.reachable = pick_reachable and best["reachable"]
@@ -989,5 +1251,5 @@ class TransferJob(PalletJob):
             report.message = (
                 f"Transferred {count} boxes: {self.source_spec.name} → "
                 f"{self.spec.name} ({self.spec.layers} layers, "
-                f"{self.spec.pattern} pattern).")
+                f"{self.spec.pattern} pattern){self._rail_summary()}.")
         return steps, np.asarray(sim, float), events, report

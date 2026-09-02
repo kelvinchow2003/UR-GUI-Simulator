@@ -54,6 +54,9 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
                    help="Console log level")
     p.add_argument("--connect", action="store_true",
                    help="Attempt to connect on startup")
+    p.add_argument("--open", metavar="FILE", default=None,
+                   help="Open a project (.urgproj) on startup and live-reload it "
+                        "when it changes on disk (used by the MCP server).")
     return p.parse_args(argv)
 
 
@@ -197,6 +200,10 @@ def main(argv: Optional[list] = None) -> int:
 
     window = build_main_window(bridge, args)
     window.show()
+
+    if args.open and hasattr(window, "load_project_file"):
+        # Defer until the event loop is up so the viewport is ready to re-pose.
+        QTimer.singleShot(200, lambda: window.load_project_file(args.open, watch=True))
 
     if args.connect:
         QTimer.singleShot(300, bridge.connect_robot)

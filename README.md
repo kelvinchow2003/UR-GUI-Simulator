@@ -86,6 +86,11 @@ freezes, even at a 125 Hz feedback rate.
 | CAD import STEP/IGES | ⚙ needs `pythonocc-core` (conda) |
 | 3-point frame calibration · toolpath `T_base_tool = T_base_cad·T_cad_path` | ✅ verified |
 | URScript + Python (`ur_rtde`) generation / export / execute | ✅ |
+| Scene obstacles / conveyors / pedestals · capsule collision checking | ✅ |
+| Palletizer: patterns, layers, payload check, pick→place job planner | ✅ |
+| Depalletize → palletize transfers between pallets | ✅ |
+| **7th axis**: lift column / track, per-layer indexing, travel recommendation | ✅ |
+| RoboDK export for an independent reach / collision / cycle-time check | ⚙ needs `robodk` + RoboDK |
 
 ---
 

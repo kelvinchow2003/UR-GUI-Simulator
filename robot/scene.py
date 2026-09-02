@@ -2,8 +2,9 @@
 robot/scene.py
 ==================================================================
 The shared **world model** around the robot: user-created collision
-obstacles plus palletizer pallets. One :class:`SceneModel` instance is
-owned by the main window; the Scene/Palletizer panel edits it, and the 3D
+obstacles, palletizer pallets, and the optional linear actuator (7th axis)
+the robot itself is mounted on. One :class:`SceneModel` instance is owned
+by the main window; the Scene/Palletizer panel edits it, and the 3D
 viewport renders whatever it holds.
 
 Everything is base-frame metres. The model is deliberately Qt-aware (it
@@ -22,6 +23,7 @@ from PySide6.QtCore import QObject, Signal
 
 from robot.collision import Box
 from robot.palletizer import PalletSpec, generate_placements
+from robot.rail import RailSpec
 
 
 class SceneModel(QObject):
@@ -31,22 +33,29 @@ class SceneModel(QObject):
         super().__init__(parent)
         self.obstacles: List[Box] = []
         self.pallets: List[PalletSpec] = []
+        # The 7th axis. Always present so panels can bind to it; it only takes
+        # effect (mount, render, collide, index during a job) once enabled.
+        self.rail: RailSpec = RailSpec()
 
     # ---- (de)serialisation ------------------------------------------------
     def to_dict(self) -> dict:
-        """The whole editable world (obstacles + pallets) as plain data."""
+        """The whole editable world (obstacles + pallets + rail) as plain data."""
         return {"obstacles": [b.to_dict() for b in self.obstacles],
-                "pallets": [p.to_dict() for p in self.pallets]}
+                "pallets": [p.to_dict() for p in self.pallets],
+                "rail": self.rail.to_dict()}
 
     def load_dict(self, d: dict) -> None:
         """Replace the scene contents from a saved dict and notify views once."""
         self.obstacles = [Box.from_dict(x) for x in d.get("obstacles", [])]
         self.pallets = [PalletSpec.from_dict(x) for x in d.get("pallets", [])]
+        # projects saved before the 7th axis existed simply have no rail
+        self.rail = RailSpec.from_dict(d["rail"]) if d.get("rail") else RailSpec()
         self.changed.emit()
 
     def clear(self) -> None:
         self.obstacles = []
         self.pallets = []
+        self.rail = RailSpec()
         self.changed.emit()
 
     # ---- obstacles --------------------------------------------------------
@@ -99,6 +108,33 @@ class SceneModel(QObject):
         tops = [float(b.T[2, 3] + b.half[2]) for b in self.obstacles
                 if b.kind == "pedestal" and b.enabled]
         return max(tops) if tops else 0.0
+
+    # ---- rail (7th axis) --------------------------------------------------
+    def robot_base_pose(self, current=None) -> np.ndarray:
+        """Where the robot base actually sits, given the mount hardware.
+
+        With a rail enabled the carriage owns the base pose completely (its
+        origin already stands on whatever pedestal is under it). Without one
+        the robot keeps its X/Y/rotation and just rides the pedestal stack.
+        """
+        if self.rail is not None and self.rail.enabled:
+            return self.rail.base_pose()
+        T = np.eye(4) if current is None else np.asarray(current, float).copy()
+        T[2, 3] = self.pedestal_height()
+        return T
+
+    def mount_rail_at(self, base_pose) -> None:
+        """Anchor the rail at the robot's current mount point — so fitting one,
+        or dragging a rail-mounted robot, moves the hardware to the arm rather
+        than teleporting the arm to the hardware."""
+        T = np.asarray(base_pose, float).reshape(4, 4).copy()
+        T[2, 3] = max(float(T[2, 3]), self.pedestal_height())
+        self.rail.anchor_to(T)
+        self.changed.emit()
+
+    def rail_boxes(self) -> List[Box]:
+        """The rail's fixed structure as collision solids (empty when off)."""
+        return self.rail.collision_boxes() if self.rail is not None else []
 
     # ---- conveyors --------------------------------------------------------
     def add_conveyor(self, length: float, width: float, height: float,
@@ -206,6 +242,7 @@ class SceneModel(QObject):
         is being simulated.
         """
         boxes: List[Box] = [b for b in self.obstacles if b.enabled]
+        boxes += self.rail_boxes()
         for j, spec in enumerate(self.pallets):
             if j == exclude_pallet:
                 continue
@@ -229,6 +266,7 @@ class SceneModel(QObject):
         must avoid the real boxes already on pallet 1, and errors if it can't."""
         filled = set(filled or ())
         boxes: List[Box] = [b for b in self.obstacles if b.enabled]
+        boxes += self.rail_boxes()
         for j, spec in enumerate(self.pallets):
             if j != target:
                 boxes.append(spec.pallet_box())        # every other slab is solid
@@ -245,6 +283,9 @@ class SceneModel(QObject):
         viewport can map a picked actor back to the scene item the user clicked.
         """
         specs = []
+        # the rail's fixed structure first, so pallets/obstacles draw over it
+        if self.rail is not None:
+            specs += self.rail.render_specs()
         _obstacle_colors = {"pedestal": "#4c566a", "conveyor": "#434c5e"}
         for i, b in enumerate(self.obstacles):
             specs.append(dict(T=b.T, half=b.half, name=b.name, kind=b.kind,

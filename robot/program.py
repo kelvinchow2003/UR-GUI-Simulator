@@ -32,6 +32,7 @@ class StepType(str, Enum):
     DELAY = "Delay"
     SET_DO = "SetDigitalOut"
     WAIT_DI = "WaitDigitalIn"
+    RAIL_MOVE = "RailMove"     # index the 7th axis (see robot.rail)
     COMMENT = "Comment"
 
 
@@ -57,6 +58,7 @@ class ProgramStep:
     pin: int = 0                               # for SET_DO / WAIT_DI
     value: bool = True                         # for SET_DO
     text: str = ""                             # for COMMENT
+    rail_pos: float = 0.0                      # for RAIL_MOVE — 7th-axis target (m)
     enabled: bool = True
     uid: int = field(default_factory=lambda: ProgramStep._next_uid())
 
@@ -84,6 +86,8 @@ class ProgramStep:
             return f"DO[{self.pin}] = {'ON' if self.value else 'OFF'}"
         if t is StepType.WAIT_DI:
             return f"Wait DI[{self.pin}]"
+        if t is StepType.RAIL_MOVE:
+            return f"Rail → {self.rail_pos * 1000:.0f} mm"
         if t is StepType.COMMENT:
             return f"# {self.text}"
         return t.value
@@ -113,6 +117,11 @@ class Program:
     default_j_accel: float = 1.40
     default_l_speed: float = 0.25
     default_l_accel: float = 1.20
+    #: How a ``RAIL_MOVE`` step is wired to the real 7th-axis drive. Lives on
+    #: the program (not on every step) because it is one physical actuator:
+    #: ``{"name", "ao" , "ao_scale", "do", "di"}`` — pins are -1 when unused, in
+    #: which case the generators emit a clearly-marked stub to fill in.
+    rail_io: Dict = field(default_factory=dict)
 
     # ---- list ops used by the tree view -----------------------------------
     def add(self, step: ProgramStep, index: Optional[int] = None) -> None:
@@ -146,6 +155,7 @@ class Program:
             "default_j_accel": self.default_j_accel,
             "default_l_speed": self.default_l_speed,
             "default_l_accel": self.default_l_accel,
+            "rail_io": dict(self.rail_io),
             "steps": [s.to_dict() for s in self.steps],
         }
 
@@ -158,6 +168,7 @@ class Program:
             default_j_accel=d.get("default_j_accel", 1.40),
             default_l_speed=d.get("default_l_speed", 0.25),
             default_l_accel=d.get("default_l_accel", 1.20),
+            rail_io=dict(d.get("rail_io", {})),
         )
         prog.steps = [ProgramStep.from_dict(s) for s in d.get("steps", [])]
         return prog
@@ -172,6 +183,7 @@ class Program:
         self.default_j_accel = other.default_j_accel
         self.default_l_speed = other.default_l_speed
         self.default_l_accel = other.default_l_accel
+        self.rail_io = dict(other.rail_io)
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), indent=2)
@@ -186,6 +198,67 @@ class Program:
 # ===========================================================================
 def _fmt_list(vals, prec=6) -> str:
     return "[" + ", ".join(f"{v:.{prec}f}" for v in vals) + "]"
+
+
+def _rail_cfg(prog: "Program") -> dict:
+    """The program's 7th-axis I/O map, with every field defaulted."""
+    c = dict(prog.rail_io or {})
+    scale = float(c.get("ao_scale", 1.0))
+    return {"name": str(c.get("name", "rail")),
+            "ao": int(c.get("ao", -1)),
+            "ao_scale": scale if abs(scale) > 1e-9 else 1.0,
+            "do": int(c.get("do", -1)),
+            "di": int(c.get("di", -1))}
+
+
+def _rail_setpoint(pos: float, scale: float):
+    """(ratio, note) for an analog position setpoint. UR analog outs carry a
+    0..1 ratio, so a target outside the drive's full scale is clipped — and
+    said so in the generated code rather than silently truncated."""
+    raw = float(pos) / float(scale)
+    ratio = min(max(raw, 0.0), 1.0)
+    note = ("" if abs(raw - ratio) < 1e-9 else
+            f"  # ⚠ {pos*1000:.0f} mm is outside the 0..{scale*1000:.0f} mm "
+            f"full scale — clipped")
+    return ratio, note
+
+
+def _rail_lines(s: ProgramStep, prog: "Program", ur: bool) -> List[str]:
+    """Code for one 7th-axis move, in URScript (``ur``) or ur_rtde Python.
+
+    Emitted as a setpoint + go/done handshake, which is how most external
+    linear axes are driven from a UR. With no pins configured the step becomes
+    a clearly-marked stub so nobody ships a program that silently never moves
+    the actuator.
+    """
+    c = _rail_cfg(prog)
+    mm = float(s.rail_pos) * 1000.0
+    out = [f"# {c['name']}: move 7th axis to {mm:.0f} mm"]
+    if c["ao"] < 0 and c["do"] < 0:
+        out += ["# TODO wire this up — set the rail's analog/digital pins in the",
+                "#      Scene panel's 7th-axis group to generate a real handshake,",
+                "#      or replace this comment with your own URCap / fieldbus call.",
+                "#      The arm poses below assume the axis IS at this position."]
+        return out
+    if c["ao"] >= 0:
+        ratio, note = _rail_setpoint(s.rail_pos, c["ao_scale"])
+        out.append((f"set_standard_analog_out({c['ao']}, {ratio:.6f}){note}" if ur
+                    else f"rtde_io.setAnalogOutputVoltage({c['ao']}, {ratio:.6f}){note}"))
+    if c["do"] >= 0:
+        out.append((f"set_standard_digital_out({c['do']}, True)  # start the move"
+                    if ur else
+                    f"rtde_io.setStandardDigitalOut({c['do']}, True)  # start the move"))
+    if c["di"] >= 0:
+        if ur:
+            out += [f"while (get_standard_digital_in({c['di']}) == False):",
+                    "    sync()", "end"]
+        else:
+            out += [f"while not rtde_r.getDigitalInState({c['di']}):",
+                    "    time.sleep(0.01)"]
+    if c["do"] >= 0:
+        out.append((f"set_standard_digital_out({c['do']}, False)" if ur else
+                    f"rtde_io.setStandardDigitalOut({c['do']}, False)"))
+    return out
 
 
 class URScriptGenerator:
@@ -230,6 +303,8 @@ class URScriptGenerator:
         if t is StepType.WAIT_DI:
             return (f"while (get_standard_digital_in({s.pin}) == False):\n"
                     f"        sync()\n    end")
+        if t is StepType.RAIL_MOVE:
+            return "\n    ".join(_rail_lines(s, prog, ur=True))
         if t is StepType.COMMENT:
             return f"# {s.text}"
         return f"# unsupported: {t.value}"
@@ -243,9 +318,13 @@ class PythonGenerator:
     """Render a :class:`Program` as a runnable ``ur_rtde`` Python script."""
 
     def generate(self, prog: Program, ip: str = "192.168.1.100") -> str:
-        # A "Wait DI" step reads inputs, which needs the receive interface.
+        # Reading an input needs the receive interface: a "Wait DI" step, or a
+        # rail move whose drive reports "in position" on a digital in.
+        rail_di = _rail_cfg(prog)["di"] >= 0
         needs_receive = any(
-            s.enabled and s.type is StepType.WAIT_DI for s in prog.steps)
+            s.enabled and (s.type is StepType.WAIT_DI
+                           or (s.type is StepType.RAIL_MOVE and rail_di))
+            for s in prog.steps)
         L: List[str] = []
         L.append('"""Auto-generated by UR GUI Simulator — ur_rtde control script."""')
         L.append("import time")
@@ -268,14 +347,14 @@ class PythonGenerator:
             if not s.enabled:
                 L.append(f"{ind}# (disabled) {s.label()}")
                 continue
-            for line in self._lines(s):
+            for line in self._lines(s, prog):
                 L.append(f"{ind}{line}")
         L.append("finally:")
         L.append(f"{ind}rtde_c.stopScript()")
         L.append("")
         return "\n".join(L)
 
-    def _lines(self, s: ProgramStep) -> List[str]:
+    def _lines(self, s: ProgramStep, prog: Program) -> List[str]:
         t = s.type
         if t is StepType.MOVEJ:
             return [f"rtde_c.moveJ({_fmt_list(s.q)}, {s.speed:g}, {s.accel:g})"]
@@ -295,6 +374,8 @@ class PythonGenerator:
         if t is StepType.WAIT_DI:
             return [f"while not rtde_r.getDigitalInState({s.pin}):",
                     "    time.sleep(0.01)"]
+        if t is StepType.RAIL_MOVE:
+            return _rail_lines(s, prog, ur=False)
         if t is StepType.COMMENT:
             return [f"# {s.text}"]
         return [f"# unsupported: {t.value}"]
